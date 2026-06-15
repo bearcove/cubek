@@ -71,6 +71,7 @@ pub(crate) fn apply_quantization(
         output_handle.clone().binding(),
         scale_handle.binding(),
         out_scale_handle.clone().binding(),
+        cubek_quant::qa_matmul::Codebook(&[]),
         &scheme,
         input_elem,
     )

@@ -8,6 +8,12 @@ use cubek_quant::{
     scheme::QuantStore, scheme::QuantValue,
 };
 
+// 16-level Lloyd-Max TQ4 centroids (matches the caller-owned table bee injects).
+const Q4F: [f32; 16] = [
+    -2.732590, -2.069017, -1.618046, -1.256231, -0.942340, -0.656759, -0.388048, -0.128395,
+    0.128395, 0.388048, 0.656759, 0.942340, 1.256231, 1.618046, 2.069017, 2.732590,
+];
+
 // Outermost TQ4 centroid and the largest half-gap between adjacent centroids
 // (at the tails) — the worst-case nearest-centroid reconstruction error / scale.
 const Q4F_MAX_CENTROID: f32 = 2.732590;
@@ -18,15 +24,25 @@ const Q4F_MAX_HALF_GAP: f32 = (2.732590 - 2.069017) / 2.0;
 #[test]
 fn test_codebook_q4f_roundtrip() {
     // map data into the centroid range [-2.73, 2.73]; error = max half-gap * scale.
-    roundtrip(QuantValue::Q4F, Q4F_MAX_CENTROID, Q4F_MAX_HALF_GAP);
+    roundtrip(
+        QuantValue::Q4F,
+        cubek_quant::qa_matmul::Codebook(&Q4F),
+        Q4F_MAX_CENTROID,
+        Q4F_MAX_HALF_GAP,
+    );
 }
 
 /// TQ8 (linear codebook = affine offset-binary): value = (code - 128) * scale;
-/// error is half a quant step (scale/2).
+/// error is half a quant step (scale/2). Linear → no centroid table needed.
 #[test]
 fn test_codebook_q8f_roundtrip() {
     // map data into [-127, 127] (code range, offset-binary); error = scale/2.
-    roundtrip(QuantValue::Q8F, 127.0, 0.5);
+    roundtrip(
+        QuantValue::Q8F,
+        cubek_quant::qa_matmul::Codebook(&[]),
+        127.0,
+        0.5,
+    );
 }
 
 // 64-level Lloyd-Max TQ6 centroids (matches cubek-quant's table).
@@ -108,6 +124,7 @@ fn test_codebook_q6f_dense_dequant() {
         input.binding(),
         output_f.clone().binding(),
         scale.binding(),
+        cubek_quant::qa_matmul::Codebook(&Q6F_CENTROIDS),
         &scheme,
         f32::as_type_native_unchecked().storage_type(),
     )
@@ -135,7 +152,12 @@ fn test_codebook_q6f_dense_dequant() {
 
 /// Quantize → dequantize round-trip: choose a scale that maps the data into the
 /// representable range, then assert reconstruction within `err_per_scale * scale`.
-fn roundtrip(value: QuantValue, range_divisor: f32, err_per_scale: f32) {
+fn roundtrip(
+    value: QuantValue,
+    codebook: cubek_quant::qa_matmul::Codebook,
+    range_divisor: f32,
+    err_per_scale: f32,
+) {
     let (m, n) = (16usize, 64usize);
     let client = TestRuntime::client(&Default::default());
     let shape = shape![m, n];
@@ -210,6 +232,7 @@ fn roundtrip(value: QuantValue, range_divisor: f32, err_per_scale: f32) {
         output.clone().binding(),
         scale.binding(),
         output_scale.clone().binding(),
+        codebook,
         &scheme,
         ElemType::Float(FloatKind::Flex32),
     )
@@ -220,6 +243,7 @@ fn roundtrip(value: QuantValue, range_divisor: f32, err_per_scale: f32) {
         output.binding(),
         output_f.clone().binding(),
         output_scale.clone().binding(),
+        codebook,
         &scheme,
         f32::as_type_native_unchecked().storage_type(),
     )

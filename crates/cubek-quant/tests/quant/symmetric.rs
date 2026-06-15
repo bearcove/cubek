@@ -97,6 +97,7 @@ fn test_quantization_tensor_symmetric(m: usize, n: usize, value: QuantValue) {
         output.clone().binding(),
         scale.binding(),
         output_scale.clone().binding(),
+        cubek_quant::qa_matmul::Codebook(&[]),
         &scheme,
         ElemType::Float(FloatKind::Flex32),
     )
@@ -109,6 +110,7 @@ fn test_quantization_tensor_symmetric(m: usize, n: usize, value: QuantValue) {
         // We use a new buffer to make sure all values are correctly dequantized back.
         output_f.clone().binding(),
         output_scale.clone().binding(),
+        cubek_quant::qa_matmul::Codebook(&[]),
         &scheme,
         f32::as_type_native_unchecked().storage_type(),
     )
@@ -238,6 +240,7 @@ fn test_quantization_block_symmetric(m: usize, n: usize, value: QuantValue, bloc
         output.clone().binding(),
         scale.binding(),
         output_scale.clone().binding(),
+        cubek_quant::qa_matmul::Codebook(&[]),
         &scheme,
         ElemType::Float(FloatKind::Flex32),
     )
@@ -250,6 +253,7 @@ fn test_quantization_block_symmetric(m: usize, n: usize, value: QuantValue, bloc
         // We use a new buffer to make sure all values are correctly dequantized back.
         output_f.clone().binding(),
         output_scale.binding(),
+        cubek_quant::qa_matmul::Codebook(&[]),
         &scheme,
         f32::as_type_native_unchecked().storage_type(),
     )

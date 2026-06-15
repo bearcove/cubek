@@ -153,13 +153,13 @@ fn test_qa_forward_parity_vs_bee() {
 
     // GPU: full forward.
     let value = QuantValue::Q6F;
-    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
-    let rht = cubek_quant::qa_matmul::upload_rht_signs::<TestRuntime>(&client);
+    let cb = cubek_quant::qa_matmul::Codebook(&Q6F);
+    let rht = cubek_quant::qa_matmul::RhtSigns(&RHT_SIGNS);
     let hh = client.create_from_slice(f32::as_bytes(&hidden));
     let a_codes_h = client.empty(m * k * 6 / 32 * 4);
     let a_scales_h = client.empty(m * units * 2);
     cubek_quant::qa_matmul::launch_activation_quant::<TestRuntime>(
-        &client, value, hh, a_codes_h.clone(), a_scales_h.clone(), cb.clone(), rht, m, k,
+        &client, value, hh, a_codes_h.clone(), a_scales_h.clone(), cb, rht, m, k,
     );
     let wh = client.create_from_slice(u32::as_bytes(&w_words));
     let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
@@ -251,8 +251,8 @@ fn test_qa_forward_end_to_end() {
 
     // GPU: quantize activations, then QA matmul.
     let value = QuantValue::Q6F;
-    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
-    let rht = cubek_quant::qa_matmul::upload_rht_signs::<TestRuntime>(&client);
+    let cb = cubek_quant::qa_matmul::Codebook(&Q6F);
+    let rht = cubek_quant::qa_matmul::RhtSigns(&RHT_SIGNS);
     let hh = client.create_from_slice(f32::as_bytes(&hidden));
     let a_codes_h = client.empty(m * k * 6 / 32 * 4);
     let a_scales_h = client.empty(m * units * 2);
@@ -262,7 +262,7 @@ fn test_qa_forward_end_to_end() {
         hh,
         a_codes_h.clone(),
         a_scales_h.clone(),
-        cb.clone(),
+        cb,
         rht,
         m,
         k,
@@ -358,7 +358,7 @@ fn bench_qa_panel_vs_naive() {
 
     let reps = 20;
     let value = QuantValue::Q6F;
-    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
+    let cb = cubek_quant::qa_matmul::Codebook(&Q6F);
     // naive
     let ach = client.create_from_slice(u32::as_bytes(&a_words));
     let ash = client.create_from_slice(f16::as_bytes(&a_scale));
@@ -368,7 +368,7 @@ fn bench_qa_panel_vs_naive() {
     let t0 = std::time::Instant::now();
     for _ in 0..reps {
         cubek_quant::qa_matmul::launch::<TestRuntime>(
-            &client, value, ach.clone(), ash.clone(), wch.clone(), wsh.clone(), cb.clone(),
+            &client, value, ach.clone(), ash.clone(), wch.clone(), wsh.clone(), cb,
             o1.clone(), m, n, k,
         );
     }
@@ -381,7 +381,7 @@ fn bench_qa_panel_vs_naive() {
     let t1 = std::time::Instant::now();
     for _ in 0..reps {
         cubek_quant::qa_matmul::launch_panel::<TestRuntime>(
-            &client, value, af.clone(), wch.clone(), wsh.clone(), cb.clone(), o2.clone(), m, n, k,
+            &client, value, af.clone(), wch.clone(), wsh.clone(), cb, o2.clone(), m, n, k,
         );
     }
     let _ = client.read_one(o2).unwrap();
@@ -430,7 +430,7 @@ fn test_qa_gemm_panel() {
     }
 
     let value = QuantValue::Q6F;
-    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
+    let cb = cubek_quant::qa_matmul::Codebook(&Q6F);
     let ah = client.create_from_slice(f32::as_bytes(&a));
     let wh = client.create_from_slice(u32::as_bytes(&w_words));
     let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
@@ -506,7 +506,7 @@ fn test_qa_matmul_tq6() {
     }
 
     let value = QuantValue::Q6F;
-    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
+    let cb = cubek_quant::qa_matmul::Codebook(&Q6F);
     let ah = client.create_from_slice(u32::as_bytes(&a_words));
     let ash = client.create_from_slice(f16::as_bytes(&a_scale));
     let wh = client.create_from_slice(u32::as_bytes(&w_words));
@@ -604,7 +604,7 @@ fn test_qa_matmul_tq4() {
     }
 
     let value = QuantValue::Q4F;
-    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
+    let cb = cubek_quant::qa_matmul::Codebook(&Q4F);
     let ah = client.create_from_slice(u32::as_bytes(&a_words));
     let ash = client.create_from_slice(f16::as_bytes(&a_scale));
     let wh = client.create_from_slice(u32::as_bytes(&w_words));
