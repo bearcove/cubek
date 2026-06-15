@@ -5,7 +5,9 @@ use cubek_matmul::{
     launch::launch_ref,
     strategy::Strategy,
 };
-use cubek_quant::scheme::{QuantLevel, QuantMode, QuantParam, QuantScheme, QuantStore, QuantValue};
+use cubek_quant::scheme::{
+    Codebook, QuantLevel, QuantMode, QuantParam, QuantScheme, QuantStore, QuantValue,
+};
 use cubek_std::{InputBinding, MatrixLayout};
 use cubek_test_utils::{
     ExecutionOutcome, HostData, HostDataType, InputDataType, TestInput, TestOutcome, TestTensor,
@@ -471,6 +473,7 @@ fn test_tensor_to_binding(tensor: TestTensor) -> InputBinding<TestRuntime> {
             scale_dtype: q.scale.dtype,
             shape: q.shape,
             scheme: q.scheme,
+            codebook: Codebook(&[]),
         },
         None => InputBinding::Normal(tensor.handle.clone().binding(), tensor.handle.dtype),
     }

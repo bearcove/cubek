@@ -12,7 +12,7 @@ use cubecl::{
 };
 use cubek_quant::{
     quantize,
-    scheme::{QuantLevel, QuantScheme, QuantStore},
+    scheme::{Codebook, QuantLevel, QuantScheme, QuantStore},
 };
 use cubek_std::InputBinding;
 use cubek_test_utils::{RunSamples, TestInput};
@@ -105,6 +105,7 @@ impl Operand {
                 scale_dtype: q.scale.dtype,
                 shape: q.shape,
                 scheme: q.scheme,
+                codebook: Codebook(&[]),
             },
         }
     }
