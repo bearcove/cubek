@@ -16,20 +16,48 @@ pub mod layout;
 
 pub use cubecl_common::quant::scheme;
 
-/// Lloyd-Max centroid tables for codebook ([`scheme::QuantMode::Codebook`])
-/// quantization. Stored values index into these; dequant is `centroid[index] * scale`.
+/// Codebook ([`scheme::QuantMode::Codebook`]) quantization tables and helpers.
+///
+/// Two sub-cases, both "stored value is an index, dequant is `f(index) * scale`":
+///   - **table** (TQ3/4/6 — `Q4F` here): Lloyd-Max centroids, `f(i) = centroid[i]`.
+///   - **linear** (TQ8 — `Q8F`): plain affine in offset-binary, `f(i) = i - bias`.
+///     bee's TQ8 stores `(code - 128) * scale`, so it's not a real codebook; the
+///     linear case lets the same mode consume it directly without a 256-entry LUT.
 #[cfg(feature = "kernels")]
 pub(crate) mod codebook {
+    use crate::scheme::QuantValue;
+
     /// 4-bit (`Q4F`) codebook (TQ4): 16 reconstruction levels for a unit-variance Gaussian.
     pub(crate) const Q4F: [f32; 16] = [
         -2.732590, -2.069017, -1.618046, -1.256231, -0.942340, -0.656759, -0.388048, -0.128395,
         0.128395, 0.388048, 0.656759, 0.942340, 1.256231, 1.618046, 2.069017, 2.732590,
     ];
 
+    /// Is this value a linear (affine offset-binary) codebook rather than a table?
+    pub(crate) const fn is_linear(quant: QuantValue) -> bool {
+        matches!(quant, QuantValue::Q8F)
+    }
+
+    /// Offset-binary bias for linear codebooks: dequant is `(raw - bias)`.
+    pub(crate) const fn bias(quant: QuantValue) -> i32 {
+        match quant {
+            QuantValue::Q8F => 128,
+            _ => 0,
+        }
+    }
+
+    /// Centroid `i` for a table codebook.
+    pub(crate) const fn centroid(quant: QuantValue, i: usize) -> f32 {
+        match quant {
+            QuantValue::Q4F => Q4F[i],
+            _ => panic!("no centroid table for this quant value"),
+        }
+    }
+
     /// Midpoint boundary between centroid `i` and `i+1`. Centroids are sorted
     /// ascending, so `count(x >= boundary)` is the nearest-centroid index.
-    pub(crate) const fn q4f_boundary(i: usize) -> f32 {
-        (Q4F[i] + Q4F[i + 1]) * 0.5
+    pub(crate) const fn boundary(quant: QuantValue, i: usize) -> f32 {
+        (centroid(quant, i) + centroid(quant, i + 1)) * 0.5
     }
 }
 

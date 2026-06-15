@@ -56,13 +56,26 @@ fn quantize_codebook<F: Float, N: Size, FS: CubePrimitive>(
 ) -> Vector<F, N> {
     let levels = comptime!(1usize << quant.size_bits());
     let norm = value / Vector::cast_from(scale);
-    let mut idx = Vector::<F, N>::new(F::new(0.0));
-    #[unroll]
-    for i in 0..(levels - 1) {
-        let boundary = Vector::<F, N>::new(F::new(comptime!(crate::codebook::q4f_boundary(i))));
-        idx = idx + Vector::<F, N>::cast_from(norm.greater_equal(&boundary));
+
+    if comptime!(crate::codebook::is_linear(quant)) {
+        // Linear (affine offset-binary): index = round(value/scale) + bias, clamped.
+        let bias = F::new(comptime!(crate::codebook::bias(quant) as f32));
+        let hi = F::new(comptime!((levels - 1) as f32));
+        clamp(
+            Vector::round(norm) + Vector::new(bias),
+            Vector::new(F::new(0.0)),
+            Vector::new(hi),
+        )
+    } else {
+        // Table codebook: index = count(norm >= midpoint boundary) (sorted centroids).
+        let mut idx = Vector::<F, N>::new(F::new(0.0));
+        #[unroll]
+        for i in 0..(levels - 1) {
+            let boundary = Vector::<F, N>::new(F::new(comptime!(crate::codebook::boundary(quant, i))));
+            idx = idx + Vector::<F, N>::cast_from(norm.greater_equal(&boundary));
+        }
+        idx
     }
-    idx
 }
 
 #[cube]

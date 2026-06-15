@@ -13,12 +13,26 @@ use cubek_quant::{
 const Q4F_MAX_CENTROID: f32 = 2.732590;
 const Q4F_MAX_HALF_GAP: f32 = (2.732590 - 2.069017) / 2.0;
 
-/// Round-trip a TQ4 codebook quant: quantize to nearest centroid index, dequantize
-/// back to `centroid[idx] * scale`, and check the error is within the centroid spacing.
+/// TQ4 (table codebook): values map to nearest Lloyd-Max centroid; error is the
+/// centroid spacing.
 #[test]
 fn test_codebook_q4f_roundtrip() {
+    // map data into the centroid range [-2.73, 2.73]; error = max half-gap * scale.
+    roundtrip(QuantValue::Q4F, Q4F_MAX_CENTROID, Q4F_MAX_HALF_GAP);
+}
+
+/// TQ8 (linear codebook = affine offset-binary): value = (code - 128) * scale;
+/// error is half a quant step (scale/2).
+#[test]
+fn test_codebook_q8f_roundtrip() {
+    // map data into [-127, 127] (code range, offset-binary); error = scale/2.
+    roundtrip(QuantValue::Q8F, 127.0, 0.5);
+}
+
+/// Quantize → dequantize round-trip: choose a scale that maps the data into the
+/// representable range, then assert reconstruction within `err_per_scale * scale`.
+fn roundtrip(value: QuantValue, range_divisor: f32, err_per_scale: f32) {
     let (m, n) = (16usize, 64usize);
-    let value = QuantValue::Q4F;
     let client = TestRuntime::client(&Default::default());
     let shape = shape![m, n];
 
@@ -26,9 +40,8 @@ fn test_codebook_q4f_roundtrip() {
     let half = num_elems as f32 / 2.0;
     let data: Vec<f32> = (0..num_elems).map(|v| v as f32 - half).collect();
 
-    // Scale so data/scale lands inside the centroid range [-2.73, 2.73].
     let max_abs = data.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
-    let scale_f32 = max_abs / Q4F_MAX_CENTROID;
+    let scale_f32 = max_abs / range_divisor;
     let data_scale = vec![scale_f32];
 
     let input_alloc =
@@ -116,7 +129,7 @@ fn test_codebook_q4f_roundtrip() {
     ));
     let restored = f32::from_bytes(&computed);
 
-    let max_error = Q4F_MAX_HALF_GAP * scale_f32 * (1.0 + 1e-4);
+    let max_error = err_per_scale * scale_f32 * (1.0 + 1e-4);
     assert_eq!(restored.len(), data.len());
     for (actual, expected) in restored.iter().zip(&data) {
         let diff = (actual - expected).abs();
