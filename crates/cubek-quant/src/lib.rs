@@ -55,6 +55,16 @@ pub(crate) mod codebook {
         matches!(quant, QuantValue::Q8F)
     }
 
+    /// 1/sqrt(32) — randomized-Hadamard-transform normalization.
+    pub(crate) const INV_SQRT32: f32 = 0.176_776_69;
+
+    /// ±1 sign pattern for the 32-value RHT (the "prerot" rotation). Shared
+    /// across TQ formats.
+    pub(crate) const RHT_SIGNS: [f32; 32] = [
+        1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0,
+        -1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0,
+    ];
+
     /// Offset-binary bias for linear codebooks: dequant is `(raw - bias)`.
     pub(crate) const fn bias(quant: QuantValue) -> i32 {
         match quant {

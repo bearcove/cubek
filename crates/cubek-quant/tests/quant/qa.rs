@@ -30,6 +30,111 @@ fn pack_row(codes: &[u8]) -> Vec<u32> {
     out
 }
 
+/// Unpack 6-bit code `c` from a row's dense-packed u32 words.
+fn unpack_code(words: &[u32], c: usize) -> u8 {
+    let (word, bitoff) = (c * 6 / 32, (c * 6) % 32);
+    let lo = words[word] >> bitoff;
+    let raw = if bitoff + 6 > 32 {
+        lo | (words[word + 1] << (32 - bitoff))
+    } else {
+        lo
+    };
+    (raw & 0x3f) as u8
+}
+
+/// End-to-end QA forward: hidden → activation-quant (RHT+refine+pack) → QA matmul.
+/// Validated against a host dequant-and-matmul of the *same* (read-back) quantized
+/// operands — proves the two kernels chain correctly (codes/scales layout agrees).
+#[test]
+fn test_qa_forward_end_to_end() {
+    let (m, n, k) = (4usize, 8usize, 64usize);
+    let units = k / 16;
+    let blocks_per_row = k / 32;
+    let client = TestRuntime::client(&Default::default());
+
+    let mut s = 0xABCDEF12_3456u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    // ~unit-variance hidden so the rotated values match the centroid distribution.
+    let hidden: Vec<f32> = (0..m * k)
+        .map(|_| (((next() % 2000) as f32 / 1000.0) - 1.0) * 1.5)
+        .collect();
+    let w_code: Vec<u8> = (0..n * k).map(|_| (next() % 64) as u8).collect();
+    let w_scale: Vec<f16> = (0..n * units)
+        .map(|_| f16::from_f32(0.2 + (next() % 1000) as f32 / 2000.0))
+        .collect();
+    let mut w_words = Vec::<u32>::new();
+    for r in 0..n {
+        w_words.extend(pack_row(&w_code[r * k..(r + 1) * k]));
+    }
+
+    // GPU: quantize activations, then QA matmul.
+    let hh = client.create_from_slice(f32::as_bytes(&hidden));
+    let a_codes_h = client.empty(m * k * 6 / 32 * 4);
+    let a_scales_h = client.empty(m * units * 2);
+    cubek_quant::qa_matmul::launch_activation_quant::<TestRuntime>(
+        &client,
+        hh,
+        a_codes_h.clone(),
+        a_scales_h.clone(),
+        m,
+        k,
+    );
+    let wh = client.create_from_slice(u32::as_bytes(&w_words));
+    let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
+    let outh = client.empty(m * n * 4);
+    cubek_quant::qa_matmul::launch::<TestRuntime>(
+        &client,
+        a_codes_h.clone(),
+        a_scales_h.clone(),
+        wh,
+        wsh,
+        outh.clone(),
+        m,
+        n,
+        k,
+    );
+    let got = f32::from_bytes(&client.read_one(outh).unwrap()).to_vec();
+
+    // read back the GPU-quantized activations and dequant on host.
+    let a_words = u32::from_bytes(&client.read_one(a_codes_h).unwrap()).to_vec();
+    let a_scale = f16::from_bytes(&client.read_one(a_scales_h).unwrap()).to_vec();
+    let words_per_row = k * 6 / 32;
+    let dequant = |words: &[u32], scales: &[f16], row: usize| -> Vec<f32> {
+        let wrow = &words[row * words_per_row..(row + 1) * words_per_row];
+        (0..k)
+            .map(|c| {
+                let block = c / 32;
+                let half = c % 32 / 16; // 0 = d_lo, 1 = d_hi
+                let sc = scales[row * units + block * 2 + half].to_f32();
+                Q6F[unpack_code(wrow, c) as usize] * sc
+            })
+            .collect()
+    };
+
+    let mut max_abs = 0.0f32;
+    let mut cmax = 0.0f32;
+    for mi in 0..m {
+        let a_deq = dequant(&a_words, &a_scale, mi);
+        for ni in 0..n {
+            let w_deq = dequant(&w_words, &w_scale, ni);
+            let r: f32 = (0..k).map(|c| a_deq[c] * w_deq[c]).sum();
+            max_abs = max_abs.max((got[mi * n + ni] - r).abs());
+            cmax = cmax.max(r.abs());
+        }
+    }
+    assert!(
+        max_abs <= 1e-3 * (1.0 + cmax),
+        "QA forward chain: max|gpu-host|={max_abs} (|C|max {cmax})"
+    );
+    // sanity: the quantizer produced non-trivial output.
+    assert!(blocks_per_row >= 1 && got.iter().any(|&x| x.abs() > 1e-6));
+}
+
 /// TQ6 QA matmul: both operands TQ6-quantized; C = dequant(A) @ dequant(W)^T.
 /// Validated against a CPU dequant-and-dot oracle.
 #[test]
