@@ -1,6 +1,13 @@
 use cubecl::prelude::*;
 use cubecl::{Runtime, TestRuntime};
+use cubek_quant::scheme::QuantValue;
 use half::f16;
+
+/// 16-level Lloyd-Max TQ4 centroids (must match cubek-quant's `Q4F` table).
+const Q4F: [f32; 16] = [
+    -2.732590, -2.069017, -1.618046, -1.256231, -0.942340, -0.656759, -0.388048, -0.128395,
+    0.128395, 0.388048, 0.656759, 0.942340, 1.256231, 1.618046, 2.069017, 2.732590,
+];
 
 // 64-level Lloyd-Max TQ6 centroids (must match cubek-quant's table).
 const Q6F: [f32; 64] = [
@@ -145,17 +152,20 @@ fn test_qa_forward_parity_vs_bee() {
     }
 
     // GPU: full forward.
+    let value = QuantValue::Q6F;
+    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
+    let rht = cubek_quant::qa_matmul::upload_rht_signs::<TestRuntime>(&client);
     let hh = client.create_from_slice(f32::as_bytes(&hidden));
     let a_codes_h = client.empty(m * k * 6 / 32 * 4);
     let a_scales_h = client.empty(m * units * 2);
     cubek_quant::qa_matmul::launch_activation_quant::<TestRuntime>(
-        &client, hh, a_codes_h.clone(), a_scales_h.clone(), m, k,
+        &client, value, hh, a_codes_h.clone(), a_scales_h.clone(), cb.clone(), rht, m, k,
     );
     let wh = client.create_from_slice(u32::as_bytes(&w_words));
     let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
     let outh = client.empty(m * n * 4);
     cubek_quant::qa_matmul::launch::<TestRuntime>(
-        &client, a_codes_h, a_scales_h, wh, wsh, outh.clone(), m, n, k,
+        &client, value, a_codes_h, a_scales_h, wh, wsh, cb, outh.clone(), m, n, k,
     );
     let c_gpu = f32::from_bytes(&client.read_one(outh).unwrap()).to_vec();
 
@@ -240,14 +250,20 @@ fn test_qa_forward_end_to_end() {
     }
 
     // GPU: quantize activations, then QA matmul.
+    let value = QuantValue::Q6F;
+    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
+    let rht = cubek_quant::qa_matmul::upload_rht_signs::<TestRuntime>(&client);
     let hh = client.create_from_slice(f32::as_bytes(&hidden));
     let a_codes_h = client.empty(m * k * 6 / 32 * 4);
     let a_scales_h = client.empty(m * units * 2);
     cubek_quant::qa_matmul::launch_activation_quant::<TestRuntime>(
         &client,
+        value,
         hh,
         a_codes_h.clone(),
         a_scales_h.clone(),
+        cb.clone(),
+        rht,
         m,
         k,
     );
@@ -256,10 +272,12 @@ fn test_qa_forward_end_to_end() {
     let outh = client.empty(m * n * 4);
     cubek_quant::qa_matmul::launch::<TestRuntime>(
         &client,
+        value,
         a_codes_h.clone(),
         a_scales_h.clone(),
         wh,
         wsh,
+        cb,
         outh.clone(),
         m,
         n,
@@ -339,6 +357,8 @@ fn bench_qa_panel_vs_naive() {
     }
 
     let reps = 20;
+    let value = QuantValue::Q6F;
+    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
     // naive
     let ach = client.create_from_slice(u32::as_bytes(&a_words));
     let ash = client.create_from_slice(f16::as_bytes(&a_scale));
@@ -348,7 +368,8 @@ fn bench_qa_panel_vs_naive() {
     let t0 = std::time::Instant::now();
     for _ in 0..reps {
         cubek_quant::qa_matmul::launch::<TestRuntime>(
-            &client, ach.clone(), ash.clone(), wch.clone(), wsh.clone(), o1.clone(), m, n, k,
+            &client, value, ach.clone(), ash.clone(), wch.clone(), wsh.clone(), cb.clone(),
+            o1.clone(), m, n, k,
         );
     }
     let _ = client.read_one(o1).unwrap();
@@ -360,7 +381,7 @@ fn bench_qa_panel_vs_naive() {
     let t1 = std::time::Instant::now();
     for _ in 0..reps {
         cubek_quant::qa_matmul::launch_panel::<TestRuntime>(
-            &client, af.clone(), wch.clone(), wsh.clone(), o2.clone(), m, n, k,
+            &client, value, af.clone(), wch.clone(), wsh.clone(), cb.clone(), o2.clone(), m, n, k,
         );
     }
     let _ = client.read_one(o2).unwrap();
@@ -408,12 +429,14 @@ fn test_qa_gemm_panel() {
         }
     }
 
+    let value = QuantValue::Q6F;
+    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
     let ah = client.create_from_slice(f32::as_bytes(&a));
     let wh = client.create_from_slice(u32::as_bytes(&w_words));
     let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
     let outh = client.empty(m * n * 4);
     cubek_quant::qa_matmul::launch_panel::<TestRuntime>(
-        &client, ah, wh, wsh, outh.clone(), m, n, k,
+        &client, value, ah, wh, wsh, cb, outh.clone(), m, n, k,
     );
     let got = f32::from_bytes(&client.read_one(outh).unwrap()).to_vec();
 
@@ -482,6 +505,8 @@ fn test_qa_matmul_tq6() {
         }
     }
 
+    let value = QuantValue::Q6F;
+    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
     let ah = client.create_from_slice(u32::as_bytes(&a_words));
     let ash = client.create_from_slice(f16::as_bytes(&a_scale));
     let wh = client.create_from_slice(u32::as_bytes(&w_words));
@@ -490,10 +515,12 @@ fn test_qa_matmul_tq6() {
 
     cubek_quant::qa_matmul::launch::<TestRuntime>(
         &client,
+        value,
         ah,
         ash,
         wh,
         wsh,
+        cb,
         outh.clone(),
         m,
         n,
@@ -508,6 +535,95 @@ fn test_qa_matmul_tq6() {
         assert!(
             diff <= 1e-4 * (1.0 + cmax),
             "QA matmul [{i}]: expected {} got {g} (diff {diff})",
+            oracle[i]
+        );
+    }
+}
+
+/// Dense-pack a row of 4-bit codes (code j at bit 4j) into u32 words (8 per u32).
+fn pack_row4(codes: &[u8]) -> Vec<u32> {
+    let words = codes.len() * 4 / 32;
+    let mut out = vec![0u32; words];
+    for (j, &c) in codes.iter().enumerate() {
+        let code = (c & 0x0f) as u32;
+        out[j * 4 / 32] |= code << ((j * 4) % 32);
+    }
+    out
+}
+
+/// TQ4 QA matmul: both operands TQ4-quantized; C = dequant(A) @ dequant(W)^T.
+/// Same kernel as the TQ6 test, just `QuantValue::Q4F` + the Q4F table — proves
+/// the data-driven path is genuinely codebook-agnostic (4-bit codes, 16 levels,
+/// 2 u32 per 16-code unit). Validated against a CPU dequant-and-dot oracle.
+#[test]
+fn test_qa_matmul_tq4() {
+    let (m, n, k) = (8usize, 8usize, 64usize); // k divisible by 16
+    let units = k / 16;
+    let wpu = 4 * 16 / 32; // 2 u32 per 16-code unit
+    let client = TestRuntime::client(&Default::default());
+
+    let mut s = 0xBEEF_4444_1357u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let a_code: Vec<u8> = (0..m * k).map(|_| (next() % 16) as u8).collect();
+    let w_code: Vec<u8> = (0..n * k).map(|_| (next() % 16) as u8).collect();
+    let a_scale: Vec<f16> = (0..m * units)
+        .map(|_| f16::from_f32(0.2 + (next() % 1000) as f32 / 2000.0))
+        .collect();
+    let w_scale: Vec<f16> = (0..n * units)
+        .map(|_| f16::from_f32(0.2 + (next() % 1000) as f32 / 2000.0))
+        .collect();
+
+    let mut a_words = Vec::<u32>::new();
+    for r in 0..m {
+        a_words.extend(pack_row4(&a_code[r * k..(r + 1) * k]));
+    }
+    let mut w_words = Vec::<u32>::new();
+    for r in 0..n {
+        w_words.extend(pack_row4(&w_code[r * k..(r + 1) * k]));
+    }
+
+    let mut oracle = vec![0.0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for u in 0..units {
+                let mut block = 0.0f32;
+                for j in 0..16 {
+                    let c = u * 16 + j;
+                    block += Q4F[a_code[mi * k + c] as usize] * Q4F[w_code[ni * k + c] as usize];
+                }
+                acc += block * a_scale[mi * units + u].to_f32() * w_scale[ni * units + u].to_f32();
+            }
+            oracle[mi * n + ni] = acc;
+        }
+    }
+
+    let value = QuantValue::Q4F;
+    let cb = cubek_quant::qa_matmul::upload_codebook::<TestRuntime>(&client, value);
+    let ah = client.create_from_slice(u32::as_bytes(&a_words));
+    let ash = client.create_from_slice(f16::as_bytes(&a_scale));
+    let wh = client.create_from_slice(u32::as_bytes(&w_words));
+    let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
+    let outh = client.empty(m * n * 4);
+    let _ = wpu;
+
+    cubek_quant::qa_matmul::launch::<TestRuntime>(
+        &client, value, ah, ash, wh, wsh, cb, outh.clone(), m, n, k,
+    );
+
+    let bytes = client.read_one(outh).unwrap();
+    let got = f32::from_bytes(&bytes);
+    let cmax = oracle.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+    for (i, &g) in got.iter().enumerate() {
+        let diff = (g - oracle[i]).abs();
+        assert!(
+            diff <= 1e-4 * (1.0 + cmax),
+            "TQ4 QA matmul [{i}]: expected {} got {g} (diff {diff})",
             oracle[i]
         );
     }
