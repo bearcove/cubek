@@ -92,7 +92,13 @@ pub fn dequantize_symmetric_packed_value<
 
     #[unroll]
     for i in 0..vector_size_values {
-        let floats = unpack_q::<F, NF, QS>(values.extract(i), scheme.value, scheme.store);
+        // Symmetric: bits are a signed int. Codebook: bits are a centroid index.
+        // The per-block scale multiply is identical for both.
+        let floats = if comptime!(matches!(scheme.mode, QuantMode::Codebook)) {
+            unpack_codebook::<F, NF, QS>(values.extract(i), scheme.value, scheme.store)
+        } else {
+            unpack_q::<F, NF, QS>(values.extract(i), scheme.value, scheme.store)
+        };
         let scale = scales.read((position * vector_size_values) + i * num_quants);
         let values = dequantize_symmetric::<F, FS, NF>(floats, scale);
         tmp[i] = values;
@@ -133,6 +139,41 @@ fn unpack_q<F: Float, NF: Size, QS: Int>(
         let signed_value = raw_i32 - (is_negative * two_pow_n);
 
         output.insert(position, F::cast_from(signed_value));
+    }
+
+    output
+}
+
+/// Unpack a codebook-quantized integer into a vector of floats. Same bit
+/// extraction as [`unpack_q`], but the raw bits are an *unsigned index* into a
+/// centroid table rather than a signed value. The table is materialized into a
+/// local array (filled from the comptime constants) and indexed at runtime.
+#[cube]
+fn unpack_codebook<F: Float, NF: Size, QS: Int>(
+    value: QS,
+    #[comptime] quant: QuantValue,
+    #[comptime] store: QuantStore,
+) -> Vector<F, NF> {
+    let size_quant = quant.size_bits();
+    let size_store = store.size_bits(&quant);
+    let num_quant = size_store / size_quant;
+    let levels = comptime!(1usize << size_quant);
+
+    // materialize the centroid LUT (comptime-filled, runtime-indexed).
+    let mut lut = Array::<F>::new(levels);
+    #[unroll]
+    for i in 0..levels {
+        lut[i] = F::new(comptime!(crate::codebook::Q4F[i]));
+    }
+
+    let mut output = Vector::empty();
+    let mask = QS::from_int((1 << size_quant) - 1);
+
+    #[unroll]
+    for position in 0..num_quant {
+        let offset = QS::cast_from(position * size_quant);
+        let raw = (value >> offset) & mask;
+        output.insert(position, lut[u32::cast_from(raw) as usize]);
     }
 
     output
@@ -290,7 +331,7 @@ fn dequantize_packed<R: Runtime>(
         QuantScheme {
             level: QuantLevel::Tensor | QuantLevel::Block(_),
             store: QuantStore::PackedU32(_),
-            mode: QuantMode::Symmetric,
+            mode: QuantMode::Symmetric | QuantMode::Codebook,
             ..
         } => unsafe {
             dequantize_symmetric_packed_kernel::launch_unchecked(

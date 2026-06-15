@@ -1,6 +1,8 @@
 use cubecl::{Runtime, prelude::*};
 use cubek_quant::scheme::{QuantLevel, QuantParam};
 
+mod codebook;
+
 #[macro_export]
 macro_rules! testgen_quant {
     ($value: expr, $shape_x: expr, $shape_y: expr) => {
