@@ -2,6 +2,7 @@ use cubecl::{Runtime, prelude::*};
 use cubek_quant::scheme::{QuantLevel, QuantParam};
 
 mod codebook;
+mod qa;
 
 #[macro_export]
 macro_rules! testgen_quant {

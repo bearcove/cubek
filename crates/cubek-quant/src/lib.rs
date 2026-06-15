@@ -11,6 +11,9 @@ pub mod quantize;
 #[cfg(feature = "kernels")]
 pub mod layout;
 
+#[cfg(feature = "kernels")]
+pub mod qa_matmul;
+
 pub use cubecl_common::quant::scheme;
 
 /// Codebook ([`scheme::QuantMode::Codebook`]) quantization tables and helpers.
