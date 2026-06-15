@@ -245,6 +245,14 @@ pub fn launch_ref<R: Runtime>(
             scale_dtype,
         ),
         QuantScheme {
+            store: QuantStore::PackedU32Dense(_),
+            ..
+        } => {
+            // Dense packing (TQ6) is consumed via dequantize; packing densely on
+            // GPU is not implemented yet (done at model-pack time on CPU).
+            panic!("dense (PackedU32Dense) quantize not implemented");
+        }
+        QuantScheme {
             value: QuantValue::Q8F | QuantValue::Q8S | QuantValue::E4M3 | QuantValue::E5M2,
             store: QuantStore::Native,
             ..
