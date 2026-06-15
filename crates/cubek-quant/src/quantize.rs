@@ -45,6 +45,26 @@ fn quantize_symmetric_q<F: Float, N: Size, FS: CubePrimitive, Q: Scalar>(
     ))
 }
 
+/// Codebook quantize: map each value to its nearest centroid *index*. Centroids
+/// are sorted ascending, so the index is `count(value/scale >= boundary[i])`
+/// over the midpoint boundaries — an unrolled sum of comparisons, no search.
+#[cube]
+fn quantize_codebook<F: Float, N: Size, FS: CubePrimitive>(
+    value: Vector<F, N>,
+    scale: FS,
+    #[comptime] quant: QuantValue,
+) -> Vector<F, N> {
+    let levels = comptime!(1usize << quant.size_bits());
+    let norm = value / Vector::cast_from(scale);
+    let mut idx = Vector::<F, N>::new(F::new(0.0));
+    #[unroll]
+    for i in 0..(levels - 1) {
+        let boundary = Vector::<F, N>::new(F::new(comptime!(crate::codebook::q4f_boundary(i))));
+        idx = idx + Vector::<F, N>::cast_from(norm.greater_equal(&boundary));
+    }
+    idx
+}
+
 #[cube]
 fn quantize_packed_value<F: Float, N: Size, FS: CubePrimitive, QS: Int>(
     value: Vector<F, N>,
@@ -53,7 +73,11 @@ fn quantize_packed_value<F: Float, N: Size, FS: CubePrimitive, QS: Int>(
     range_max: F,
     #[comptime] scheme: QuantScheme,
 ) -> QS {
-    let value = quantize_symmetric::<F, N, FS>(value, scale, range_min, range_max);
+    let value = if comptime!(matches!(scheme.mode, QuantMode::Codebook)) {
+        quantize_codebook::<F, N, FS>(value, scale, scheme.value)
+    } else {
+        quantize_symmetric::<F, N, FS>(value, scale, range_min, range_max)
+    };
     pack_q::<F, N, QS>(value, scheme.value)
 }
 
@@ -331,7 +355,7 @@ fn quantize_packed<R: Runtime>(
     let mut can_vectorize = match scheme {
         QuantScheme {
             level: QuantLevel::Tensor | QuantLevel::Block(_),
-            mode: QuantMode::Symmetric,
+            mode: QuantMode::Symmetric | QuantMode::Codebook,
             store: QuantStore::PackedU32(dim),
             ..
         } => {
