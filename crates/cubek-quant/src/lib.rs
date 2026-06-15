@@ -23,8 +23,16 @@ pub use cubecl_common::quant::scheme;
 ///   - **linear** (TQ8 — `Q8F`): plain affine in offset-binary, `f(i) = i - bias`.
 ///     bee's TQ8 stores `(code - 128) * scale`, so it's not a real codebook; the
 ///     linear case lets the same mode consume it directly without a 256-entry LUT.
+///
+/// These arrays are the *default* reconstruction tables. They are NOT baked into
+/// the kernels: every codebook kernel reads its LUT (and the RHT sign pattern)
+/// from a runtime buffer, so a caller can override the table entirely (see
+/// [`qa_matmul::upload_codebook`] / [`qa_matmul::upload_rht_signs`], and the
+/// `codebook: Handle` argument threaded through every `qa_matmul` launch). The
+/// tables below are exposed via [`table`] purely as the convenient default
+/// source a caller uploads when it doesn't supply its own.
 #[cfg(feature = "kernels")]
-pub(crate) mod codebook {
+pub mod codebook {
     use crate::scheme::QuantValue;
 
     /// 4-bit (`Q4F`) codebook (TQ4): 16 reconstruction levels for a unit-variance Gaussian.
@@ -52,12 +60,30 @@ pub(crate) mod codebook {
         matches!(quant, QuantValue::Q8F)
     }
 
+    /// Number of reconstruction levels (`1 << bits`) for a table codebook.
+    pub fn num_levels(quant: QuantValue) -> usize {
+        1usize << quant.size_bits()
+    }
+
+    /// Default reconstruction table for `quant` (a `1 << bits`-entry slice). This
+    /// is the *default* a caller uploads into the runtime codebook buffer; the
+    /// kernels never reference it directly. Only table (non-linear) codebooks
+    /// have one.
+    pub fn table(quant: QuantValue) -> &'static [f32] {
+        match quant {
+            QuantValue::Q4F => &Q4F,
+            QuantValue::Q6F => &Q6F,
+            _ => panic!("no centroid table for {quant:?} (linear or unimplemented codebook)"),
+        }
+    }
+
     /// 1/sqrt(32) — randomized-Hadamard-transform normalization.
     pub(crate) const INV_SQRT32: f32 = 0.176_776_69;
 
     /// ±1 sign pattern for the 32-value RHT (the "prerot" rotation). Shared
-    /// across TQ formats.
-    pub(crate) const RHT_SIGNS: [f32; 32] = [
+    /// across TQ formats. Exposed as the default a caller uploads into the
+    /// runtime `rht_signs` buffer; the kernels read it from that buffer.
+    pub const RHT_SIGNS: [f32; 32] = [
         1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0,
         -1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0,
     ];
