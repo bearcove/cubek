@@ -177,6 +177,7 @@ fn quantize_operand(
         data.clone().binding(),
         scale_in.binding(),
         scale_out.clone().binding(),
+        cubek_quant::qa_matmul::Codebook(&[]),
         scheme,
         input_elem,
     )

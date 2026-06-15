@@ -52,6 +52,7 @@ fn quantize_symmetric_q<F: Float, N: Size, FS: CubePrimitive, Q: Scalar>(
 fn quantize_codebook<F: Float, N: Size, FS: CubePrimitive>(
     value: Vector<F, N>,
     scale: FS,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] quant: QuantValue,
 ) -> Vector<F, N> {
     let levels = comptime!(1usize << quant.size_bits());
@@ -68,10 +69,13 @@ fn quantize_codebook<F: Float, N: Size, FS: CubePrimitive>(
         )
     } else {
         // Table codebook: index = count(norm >= midpoint boundary) (sorted centroids).
+        // Midpoints come from the comptime-injected codebook.
         let mut idx = Vector::<F, N>::new(F::new(0.0));
         #[unroll]
         for i in 0..(levels - 1) {
-            let boundary = Vector::<F, N>::new(F::new(comptime!(crate::codebook::boundary(quant, i))));
+            let boundary = Vector::<F, N>::new(F::new(comptime!(
+                (codebook.0[i] + codebook.0[i + 1]) * 0.5
+            )));
             idx = idx + Vector::<F, N>::cast_from(norm.greater_equal(&boundary));
         }
         idx
@@ -84,10 +88,11 @@ fn quantize_packed_value<F: Float, N: Size, FS: CubePrimitive, QS: Int>(
     scale: FS,
     range_min: F,
     range_max: F,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] scheme: QuantScheme,
 ) -> QS {
     let value = if comptime!(matches!(scheme.mode, QuantMode::Codebook)) {
-        quantize_codebook::<F, N, FS>(value, scale, scheme.value)
+        quantize_codebook::<F, N, FS>(value, scale, codebook, scheme.value)
     } else {
         quantize_symmetric::<F, N, FS>(value, scale, range_min, range_max)
     };
@@ -175,6 +180,7 @@ fn quantize_symmetric_packed_kernel<F: Float, N: Size, FS: Numeric, QS: Int>(
     mut output: LinearViewMut<'_, QS>,
     out_scale: ScalesViewMut<'_, FS>,
     scales_layout: ScalesLayout,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] scheme: QuantScheme,
     #[define(F, FS, QS)] _dtypes: [StorageType; 3],
 ) {
@@ -194,6 +200,7 @@ fn quantize_symmetric_packed_kernel<F: Float, N: Size, FS: Numeric, QS: Int>(
                 scale,
                 range_min.get::<F>(),
                 range_max.get::<F>(),
+                codebook,
                 scheme,
             ),
         );
@@ -212,19 +219,21 @@ fn quantize_symmetric_packed_kernel<F: Float, N: Size, FS: Numeric, QS: Int>(
                 scale,
                 range_min.get::<F>(),
                 range_max.get::<F>(),
+                codebook,
                 scheme,
             ),
         );
     }
 }
 
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub fn launch_ref<R: Runtime>(
     client: &ComputeClient<R>,
     input: TensorBinding<R>,
     output: TensorBinding<R>,
     scale: TensorBinding<R>,
     out_scale: TensorBinding<R>,
+    codebook: crate::qa_matmul::Codebook,
     scheme: &QuantScheme,
     input_elem: ElemType,
 ) -> Result<(), LaunchError> {
@@ -241,6 +250,7 @@ pub fn launch_ref<R: Runtime>(
             scale,
             out_scale,
             output,
+            codebook,
             input_elem,
             scale_dtype,
         ),
@@ -367,6 +377,7 @@ fn quantize_packed<R: Runtime>(
     scale: TensorBinding<R>,
     out_scale: TensorBinding<R>,
     output: TensorBinding<R>,
+    codebook: crate::qa_matmul::Codebook,
     input_dtype: ElemType,
     scale_dtype: ElemType,
 ) -> Result<(), LaunchError> {
@@ -429,6 +440,7 @@ fn quantize_packed<R: Runtime>(
             linear_view(output.clone()),
             scales_view(output, out_scale, 1, scheme),
             scales_layout,
+            codebook,
             *scheme,
             [input_dtype.into(), scale_dtype.into(), output_dtype.into()],
         )

@@ -15,15 +15,73 @@
 //! odd widths (TQ3) would need a 32-code unit and are not handled here.
 //!
 //! Nothing in this module bakes a codebook: the centroid table and the RHT sign
-//! pattern arrive as runtime buffers (`codebook`, `rht_signs`), so a caller
-//! chooses the format by passing the matching [`QuantValue`] plus its table.
-//! [`upload_codebook`] / [`upload_rht_signs`] build the default buffers from
-//! [`crate::codebook`]; callers may upload their own instead.
+//! pattern arrive as **comptime constants** ([`Codebook`], [`RhtSigns`]) injected
+//! by the caller, so a caller chooses the format by passing the matching
+//! [`QuantValue`] plus its table — the values are baked straight into the shader,
+//! never a runtime buffer and never hardcoded in this fork. The caller (e.g. bee)
+//! owns the tables.
 
 use crate::scheme::QuantValue;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
+use core::hash::{Hash, Hasher};
 use half::f16;
+
+/// A codebook (centroid table) injected by the caller as a **comptime constant**:
+/// the values are baked straight into the shader, never a runtime buffer and
+/// never hardcoded in this fork. The caller (e.g. bee) owns the table and passes
+/// `Codebook(&ITS_TABLE)`; `value`'s `num_levels` decides how many entries are read.
+///
+/// `f32` is neither `Hash` nor `Eq` (NaN), so we hash/compare by bit pattern —
+/// fine for a fixed centroid table — which lets `Codebook` be a `#[comptime]` arg
+/// (the kernel cache keys on it).
+#[derive(Clone, Copy, Debug)]
+pub struct Codebook(pub &'static [f32]);
+
+impl PartialEq for Codebook {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+impl Eq for Codebook {}
+impl Hash for Codebook {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for v in self.0 {
+            v.to_bits().hash(state);
+        }
+    }
+}
+
+/// The 32-wide ±1 RHT sign pattern (the "prerot" rotation), injected by the
+/// caller as a **comptime constant** — baked into the shader, never a runtime
+/// buffer and never hardcoded in this fork. Same bit-pattern hash/eq as
+/// [`Codebook`] so it can be a `#[comptime]` arg (the kernel cache keys on it).
+#[derive(Clone, Copy, Debug)]
+pub struct RhtSigns(pub &'static [f32]);
+
+impl PartialEq for RhtSigns {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+impl Eq for RhtSigns {}
+impl Hash for RhtSigns {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for v in self.0 {
+            v.to_bits().hash(state);
+        }
+    }
+}
 
 /// Extract code `j` (`bits`-wide) from a dense u32 stream starting at u32 offset
 /// `base`. Codes can straddle a word boundary, so a straddling read pulls the
@@ -54,8 +112,8 @@ fn qa_matmul_kernel(
     a_scales: &[f16],
     w_codes: &[u32],
     w_scales: &[f16],
-    codebook: &[f32],
     out: &mut [f32],
+    #[comptime] codebook: Codebook,
     #[comptime] n: u32,
     #[comptime] k: u32,
     #[comptime] value: QuantValue,
@@ -69,11 +127,11 @@ fn qa_matmul_kernel(
         let wpu = comptime!(words_per_unit(value)); // u32 per unit
         let levels = comptime!(crate::codebook::num_levels(value));
 
-        // centroid table (loaded from the runtime buffer, runtime-indexed).
+        // centroid table baked from the comptime-injected codebook.
         let mut lut = Array::<f32>::new(levels);
         #[unroll]
         for i in 0..levels {
-            lut[i] = codebook[i];
+            lut[i] = f32::new(comptime!(codebook.0[i]));
         }
 
         let mut acc = 0.0f32;
@@ -108,8 +166,8 @@ fn qa_gemm_panel_kernel(
     a: &[f32],       // [M, K] dequantized (prerot-space) activations
     w_codes: &[u32], // [N, K] dense codebook weights
     w_scales: &[f16],
-    codebook: &[f32],
     out: &mut [f32], // [M, N]
+    #[comptime] codebook: Codebook,
     #[comptime] m: u32,
     #[comptime] n: u32,
     #[comptime] k: u32,
@@ -127,7 +185,7 @@ fn qa_gemm_panel_kernel(
         let mut lut = Array::<f32>::new(levels);
         #[unroll]
         for i in 0..levels {
-            lut[i] = codebook[i];
+            lut[i] = f32::new(comptime!(codebook.0[i]));
         }
 
         // dequant W[col] into shared, cooperatively (one unit per stride).
@@ -170,7 +228,7 @@ pub fn launch_panel<R: Runtime>(
     a: Handle,
     w_codes: Handle,
     w_scales: Handle,
-    codebook: Handle,
+    codebook: Codebook,
     out: Handle,
     m: usize,
     n: usize,
@@ -178,7 +236,6 @@ pub fn launch_panel<R: Runtime>(
 ) {
     let units = k / 16;
     let wpu = words_per_unit(value);
-    let levels = crate::codebook::num_levels(value);
     unsafe {
         qa_gemm_panel_kernel::launch_unchecked::<R>(
             client,
@@ -187,8 +244,8 @@ pub fn launch_panel<R: Runtime>(
             BufferArg::from_raw_parts(a, m * k),
             BufferArg::from_raw_parts(w_codes, n * units * wpu),
             BufferArg::from_raw_parts(w_scales, n * units),
-            BufferArg::from_raw_parts(codebook, levels),
             BufferArg::from_raw_parts(out, m * n),
+            codebook,
             m as u32,
             n as u32,
             k as u32,
@@ -201,12 +258,12 @@ pub fn launch_panel<R: Runtime>(
 /// (centroids are sorted ascending, so `count(val >= boundary[i])` is the
 /// nearest index). Boundaries are the midpoints of adjacent `codebook` entries.
 #[cube]
-fn choose_index(val: f32, codebook: &[f32], #[comptime] value: QuantValue) -> u32 {
+fn choose_index(val: f32, #[comptime] codebook: Codebook, #[comptime] value: QuantValue) -> u32 {
     let levels = comptime!(crate::codebook::num_levels(value));
     let mut idx = 0u32;
     #[unroll]
     for i in 0..(levels - 1) {
-        let boundary = (codebook[i] + codebook[i + 1]) * 0.5f32;
+        let boundary = comptime!((codebook.0[i] + codebook.0[i + 1]) * 0.5);
         idx += u32::cast_from(val >= boundary);
     }
     idx
@@ -217,14 +274,14 @@ fn choose_index(val: f32, codebook: &[f32], #[comptime] value: QuantValue) -> u3
 /// RMS seed → 6-iter Lloyd refine → nearest-centroid → dense pack. One thread
 /// per 32-value block. Output layout matches [`launch`]'s `a_codes`/`a_scales`
 /// (`bits` u32 + 2 fp16 per 32-value block). `codebook` and `rht_signs` are the
-/// runtime-provided table and sign pattern.
+/// comptime-injected table and sign pattern.
 #[cube(launch_unchecked)]
 fn quantize_activations_kernel(
     hidden: &[f32],
     codes: &mut [u32],
     scales: &mut [f16],
-    codebook: &[f32],
-    rht_signs: &[f32],
+    #[comptime] codebook: Codebook,
+    #[comptime] rht_signs: RhtSigns,
     #[comptime] hidden_dim: u32,
     #[comptime] value: QuantValue,
 ) {
@@ -238,18 +295,18 @@ fn quantize_activations_kernel(
         let levels = comptime!(crate::codebook::num_levels(value));
         let words_per_block = comptime!(value.size_bits()); // bits·32/32 = bits
 
-        // centroid table (from the runtime buffer).
+        // centroid table baked from the comptime-injected codebook.
         let mut lut = Array::<f32>::new(levels);
         #[unroll]
         for i in 0..levels {
-            lut[i] = codebook[i];
+            lut[i] = f32::new(comptime!(codebook.0[i]));
         }
 
         // load + forward RHT (signs → butterfly → 1/sqrt(32)).
         let mut buf = Array::<f32>::new(32usize);
         #[unroll]
         for j in 0..32usize {
-            buf[j] = hidden[in_base + j] * rht_signs[j];
+            buf[j] = hidden[in_base + j] * comptime!(rht_signs.0[j]);
         }
         let mut step = 1usize;
         while step < 32 {
@@ -337,23 +394,10 @@ fn quantize_activations_kernel(
     }
 }
 
-/// Upload the default centroid table for `value` (from [`crate::codebook`]) into
-/// a device buffer, ready to pass as the `codebook` argument. Callers that own a
-/// different table can build the handle themselves instead.
-pub fn upload_codebook<R: Runtime>(client: &ComputeClient<R>, value: QuantValue) -> Handle {
-    client.create_from_slice(f32::as_bytes(crate::codebook::table(value)))
-}
-
-/// Upload the default 32-wide RHT sign pattern into a device buffer, ready to
-/// pass as the `rht_signs` argument of [`launch_activation_quant`].
-pub fn upload_rht_signs<R: Runtime>(client: &ComputeClient<R>) -> Handle {
-    client.create_from_slice(f32::as_bytes(&crate::codebook::RHT_SIGNS))
-}
-
 /// Quantize activations `hidden [m, k]` to the `value` table codebook (prerot
 /// space). Writes dense codes `[m, k·bits/32]` u32 and `[m, k/16]` fp16 scales,
-/// ready for [`launch`]. `codebook`/`rht_signs` are runtime buffers (see
-/// [`upload_codebook`] / [`upload_rht_signs`]).
+/// ready for [`launch`]. `codebook`/`rht_signs` are comptime-injected by the
+/// caller (see [`Codebook`] / [`RhtSigns`]).
 #[allow(clippy::too_many_arguments)]
 pub fn launch_activation_quant<R: Runtime>(
     client: &ComputeClient<R>,
@@ -361,13 +405,12 @@ pub fn launch_activation_quant<R: Runtime>(
     hidden: Handle,
     codes: Handle,
     scales: Handle,
-    codebook: Handle,
-    rht_signs: Handle,
+    codebook: Codebook,
+    rht_signs: RhtSigns,
     m: usize,
     k: usize,
 ) {
     let bits = value.size_bits();
-    let levels = crate::codebook::num_levels(value);
     let n_blocks = (m * k / 32) as u32;
     unsafe {
         quantize_activations_kernel::launch_unchecked::<R>(
@@ -377,8 +420,8 @@ pub fn launch_activation_quant<R: Runtime>(
             BufferArg::from_raw_parts(hidden, m * k),
             BufferArg::from_raw_parts(codes, m * k * bits / 32),
             BufferArg::from_raw_parts(scales, m * k / 16),
-            BufferArg::from_raw_parts(codebook, levels),
-            BufferArg::from_raw_parts(rht_signs, 32),
+            codebook,
+            rht_signs,
             k as u32,
             value,
         );
@@ -397,7 +440,7 @@ pub fn launch<R: Runtime>(
     a_scales: Handle,
     w_codes: Handle,
     w_scales: Handle,
-    codebook: Handle,
+    codebook: Codebook,
     out: Handle,
     m: usize,
     n: usize,
@@ -405,7 +448,6 @@ pub fn launch<R: Runtime>(
 ) {
     let units = k / 16;
     let wpu = words_per_unit(value);
-    let levels = crate::codebook::num_levels(value);
     let threads = (m * n) as u32;
     unsafe {
         qa_matmul_kernel::launch_unchecked::<R>(
@@ -416,8 +458,8 @@ pub fn launch<R: Runtime>(
             BufferArg::from_raw_parts(a_scales, m * units),
             BufferArg::from_raw_parts(w_codes, n * units * wpu),
             BufferArg::from_raw_parts(w_scales, n * units),
-            BufferArg::from_raw_parts(codebook, levels),
             BufferArg::from_raw_parts(out, m * n),
+            codebook,
             n as u32,
             k as u32,
             value,

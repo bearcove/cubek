@@ -39,12 +39,14 @@ pub fn dequantize_symmetric_packed_values<
     position: usize,
     values: &View<Vector<QI, NQ>, usize>,
     scales: &View<FS, usize>,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] scheme: QuantScheme,
 ) -> Array<Vector<F, NF>> {
     dequantize_symmetric_packed_value_at::<F, NF, FS, QI, NQ>(
         position,
         values.read(position),
         scales,
+        codebook,
         scheme,
     )
 }
@@ -64,9 +66,12 @@ pub fn dequantize_symmetric_packed_value_at<
     position: usize,
     values: Vector<QI, NQ>,
     scales: &View<FS, usize>,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] scheme: QuantScheme,
 ) -> Array<Vector<F, NF>> {
-    dequantize_symmetric_packed_value::<F, NF, FS, QI, NQ>(values, scales, position, scheme)
+    dequantize_symmetric_packed_value::<F, NF, FS, QI, NQ>(
+        values, scales, position, codebook, scheme,
+    )
 }
 
 /// Dequantize a single packed value using the scale provided.
@@ -84,6 +89,7 @@ pub fn dequantize_symmetric_packed_value<
     values: Vector<QS, NQ>,
     scales: &View<FS, usize>,
     position: usize,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] scheme: QuantScheme,
 ) -> Array<Vector<F, NF>> {
     let vector_size_values = values.vector_size();
@@ -95,7 +101,7 @@ pub fn dequantize_symmetric_packed_value<
         // Symmetric: bits are a signed int. Codebook: bits are a centroid index.
         // The per-block scale multiply is identical for both.
         let floats = if comptime!(matches!(scheme.mode, QuantMode::Codebook)) {
-            unpack_codebook::<F, NF, QS>(values.extract(i), scheme.value, scheme.store)
+            unpack_codebook::<F, NF, QS>(values.extract(i), codebook, scheme.value, scheme.store)
         } else {
             unpack_q::<F, NF, QS>(values.extract(i), scheme.value, scheme.store)
         };
@@ -151,6 +157,7 @@ fn unpack_q<F: Float, NF: Size, QS: Int>(
 #[cube]
 fn unpack_codebook<F: Float, NF: Size, QS: Int>(
     value: QS,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] quant: QuantValue,
     #[comptime] store: QuantStore,
 ) -> Vector<F, NF> {
@@ -171,12 +178,13 @@ fn unpack_codebook<F: Float, NF: Size, QS: Int>(
             output.insert(position, F::cast_from(i32::cast_from(raw) - bias));
         }
     } else {
-        // Table codebook: materialize the centroids (comptime-filled, runtime-indexed).
+        // Table codebook: materialize the centroids from the comptime-injected
+        // codebook (comptime-filled, runtime-indexed).
         let levels = comptime!(1usize << size_quant);
         let mut lut = Array::<F>::new(levels);
         #[unroll]
         for i in 0..levels {
-            lut[i] = F::new(comptime!(crate::codebook::centroid(quant, i)));
+            lut[i] = F::new(comptime!(codebook.0[i]));
         }
         #[unroll]
         for position in 0..num_quant {
@@ -197,6 +205,7 @@ fn unpack_codebook<F: Float, NF: Size, QS: Int>(
 fn unpack_dense_codebook<F: Float, NF: Size>(
     input: &LinearView<'_, Vector<u32, Const<1>>>,
     base: usize,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] scheme: QuantScheme,
 ) -> Vector<F, NF> {
     let bits = comptime!(scheme.value.size_bits());
@@ -207,7 +216,7 @@ fn unpack_dense_codebook<F: Float, NF: Size>(
     let mut lut = Array::<F>::new(levels);
     #[unroll]
     for i in 0..levels {
-        lut[i] = F::new(comptime!(crate::codebook::centroid(scheme.value, i)));
+        lut[i] = F::new(comptime!(codebook.0[i]));
     }
 
     let mut out = Vector::empty();
@@ -232,6 +241,7 @@ fn dequantize_dense_kernel<F: Float, NF: Size, FS: Numeric>(
     input: LinearView<'_, Vector<u32, Const<1>>>,
     scales: ScalesView<'_, FS>,
     mut output: LinearViewMut<'_, Vector<F, NF>>,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] scheme: QuantScheme,
     #[define(F, FS)] _dtypes: [StorageType; 2],
 ) {
@@ -239,7 +249,7 @@ fn dequantize_dense_kernel<F: Float, NF: Size, FS: Numeric>(
     if !input.is_in_bounds(base) {
         terminate!();
     }
-    let centroids = unpack_dense_codebook::<F, NF>(&input, base, scheme);
+    let centroids = unpack_dense_codebook::<F, NF>(&input, base, codebook, scheme);
     let scale = scales.read(ABSOLUTE_POS * comptime!(scheme.num_quants()));
     output.write(ABSOLUTE_POS, dequantize_symmetric::<F, FS, NF>(centroids, scale));
 }
@@ -249,6 +259,7 @@ fn dequantize_symmetric_packed_kernel<F: Float, NF: Size, FS: Numeric, QS: Int, 
     input: LinearView<'_, Vector<QS, NQ>>,
     scales: ScalesView<'_, FS>,
     mut output: LinearViewMut<'_, Vector<F, NF>>,
+    #[comptime] codebook: crate::qa_matmul::Codebook,
     #[comptime] scheme: QuantScheme,
     #[define(F, FS, QS)] _dtypes: [StorageType; 3],
 ) {
@@ -266,8 +277,9 @@ fn dequantize_symmetric_packed_kernel<F: Float, NF: Size, FS: Numeric, QS: Int, 
     let values = input.read(ABSOLUTE_POS);
     let packed_pos = ABSOLUTE_POS * scheme.num_quants();
 
-    let out =
-        dequantize_symmetric_packed_value::<F, NF, FS, QS, NQ>(values, &scales, packed_pos, scheme);
+    let out = dequantize_symmetric_packed_value::<F, NF, FS, QS, NQ>(
+        values, &scales, packed_pos, codebook, scheme,
+    );
 
     #[unroll]
     for i in 0..vector_size_in {
@@ -297,12 +309,16 @@ fn dequantize_symmetric_native_kernel<F: Float, N: Size, FS: Numeric, Q: Numeric
 }
 
 #[allow(clippy::result_large_err)]
-/// Convert the tensor back to a higher precision data type.
+/// Convert the tensor back to a higher precision data type. `codebook` is the
+/// caller-owned centroid table, baked into the shader at comptime (only the
+/// codebook / non-linear branches read it; symmetric and linear paths ignore
+/// it, so an empty `Codebook(&[])` is fine for those).
 pub fn launch_ref<R: Runtime>(
     client: &ComputeClient<R>,
     input: TensorBinding<R>,
     output: TensorBinding<R>,
     scale: TensorBinding<R>,
+    codebook: crate::qa_matmul::Codebook,
     scheme: &QuantScheme,
     output_dtype: StorageType,
 ) -> Result<(), LaunchError> {
@@ -318,6 +334,7 @@ pub fn launch_ref<R: Runtime>(
             *scheme,
             scale,
             output,
+            codebook,
             output_dtype,
             scale_dtype,
         ),
@@ -330,6 +347,7 @@ pub fn launch_ref<R: Runtime>(
             *scheme,
             scale,
             output,
+            codebook,
             output_dtype,
             scale_dtype,
         ),
@@ -370,12 +388,14 @@ pub fn launch_ref<R: Runtime>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dequantize_packed<R: Runtime>(
     client: &ComputeClient<R>,
     input: TensorBinding<R>,
     scheme: QuantScheme,
     scale: TensorBinding<R>,
     output: TensorBinding<R>,
+    codebook: crate::qa_matmul::Codebook,
     output_dtype: StorageType,
     scale_dtype: StorageType,
 ) -> Result<(), LaunchError> {
@@ -421,6 +441,7 @@ fn dequantize_packed<R: Runtime>(
                 linear_view(input.clone()),
                 scales_view(input, scale, 1, &scheme),
                 linear_view(output),
+                codebook,
                 scheme,
                 [output_dtype, scale_dtype, input_dtype.into()],
             )
@@ -433,12 +454,14 @@ fn dequantize_packed<R: Runtime>(
 
 /// Dequantize densely bit-packed codes (e.g. TQ6). Each thread handles one
 /// dense unit: `words_per_unit` u32 in -> `codes_per_unit` floats out.
+#[allow(clippy::too_many_arguments)]
 fn dequantize_dense<R: Runtime>(
     client: &ComputeClient<R>,
     input: TensorBinding<R>,
     scheme: QuantScheme,
     scale: TensorBinding<R>,
     output: TensorBinding<R>,
+    codebook: crate::qa_matmul::Codebook,
     output_dtype: StorageType,
     scale_dtype: StorageType,
 ) -> Result<(), LaunchError> {
@@ -465,6 +488,7 @@ fn dequantize_dense<R: Runtime>(
             linear_view(input.clone()),
             scales_view(input, scale, 1, &scheme),
             linear_view(output),
+            codebook,
             scheme,
             [output_dtype, scale_dtype],
         )
