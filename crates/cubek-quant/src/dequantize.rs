@@ -157,23 +157,33 @@ fn unpack_codebook<F: Float, NF: Size, QS: Int>(
     let size_quant = quant.size_bits();
     let size_store = store.size_bits(&quant);
     let num_quant = size_store / size_quant;
-    let levels = comptime!(1usize << size_quant);
-
-    // materialize the centroid LUT (comptime-filled, runtime-indexed).
-    let mut lut = Array::<F>::new(levels);
-    #[unroll]
-    for i in 0..levels {
-        lut[i] = F::new(comptime!(crate::codebook::Q4F[i]));
-    }
 
     let mut output = Vector::empty();
     let mask = QS::from_int((1 << size_quant) - 1);
 
-    #[unroll]
-    for position in 0..num_quant {
-        let offset = QS::cast_from(position * size_quant);
-        let raw = (value >> offset) & mask;
-        output.insert(position, lut[u32::cast_from(raw) as usize]);
+    if comptime!(crate::codebook::is_linear(quant)) {
+        // Linear (affine offset-binary): value = raw - bias. No LUT.
+        let bias = comptime!(crate::codebook::bias(quant));
+        #[unroll]
+        for position in 0..num_quant {
+            let offset = QS::cast_from(position * size_quant);
+            let raw = (value >> offset) & mask;
+            output.insert(position, F::cast_from(i32::cast_from(raw) - bias));
+        }
+    } else {
+        // Table codebook: materialize the centroids (comptime-filled, runtime-indexed).
+        let levels = comptime!(1usize << size_quant);
+        let mut lut = Array::<F>::new(levels);
+        #[unroll]
+        for i in 0..levels {
+            lut[i] = F::new(comptime!(crate::codebook::centroid(quant, i)));
+        }
+        #[unroll]
+        for position in 0..num_quant {
+            let offset = QS::cast_from(position * size_quant);
+            let raw = (value >> offset) & mask;
+            output.insert(position, lut[u32::cast_from(raw) as usize]);
+        }
     }
 
     output
