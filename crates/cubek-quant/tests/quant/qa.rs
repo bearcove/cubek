@@ -302,6 +302,132 @@ fn test_qa_forward_end_to_end() {
     assert!(blocks_per_row >= 1 && got.iter().any(|&x| x.abs() > 1e-6));
 }
 
+/// Timing: naive one-thread-per-output QA matmul vs the weight-reuse panel, at a
+/// moderate size. Run with `--nocapture`. (Not an assertion — informational.)
+#[test]
+fn bench_qa_panel_vs_naive() {
+    let (m, n, k) = (512usize, 512usize, 512usize);
+    let units = k / 16;
+    let client = TestRuntime::client(&Default::default());
+
+    let mut s = 0x9999_5555u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let a_code: Vec<u8> = (0..m * k).map(|_| (next() % 64) as u8).collect();
+    let w_code: Vec<u8> = (0..n * k).map(|_| (next() % 64) as u8).collect();
+    let a_scale: Vec<f16> = (0..m * units).map(|_| f16::from_f32(0.5)).collect();
+    let w_scale: Vec<f16> = (0..n * units).map(|_| f16::from_f32(0.5)).collect();
+    let mut a_words = Vec::new();
+    for r in 0..m {
+        a_words.extend(pack_row(&a_code[r * k..(r + 1) * k]));
+    }
+    let mut w_words = Vec::new();
+    for r in 0..n {
+        w_words.extend(pack_row(&w_code[r * k..(r + 1) * k]));
+    }
+    // pre-dequant A for the panel.
+    let mut a_f32 = vec![0.0f32; m * k];
+    for mi in 0..m {
+        for c in 0..k {
+            a_f32[mi * k + c] =
+                Q6F[a_code[mi * k + c] as usize] * a_scale[mi * units + c / 16].to_f32();
+        }
+    }
+
+    let reps = 20;
+    // naive
+    let ach = client.create_from_slice(u32::as_bytes(&a_words));
+    let ash = client.create_from_slice(f16::as_bytes(&a_scale));
+    let wch = client.create_from_slice(u32::as_bytes(&w_words));
+    let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
+    let o1 = client.empty(m * n * 4);
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        cubek_quant::qa_matmul::launch::<TestRuntime>(
+            &client, ach.clone(), ash.clone(), wch.clone(), wsh.clone(), o1.clone(), m, n, k,
+        );
+    }
+    let _ = client.read_one(o1).unwrap();
+    let naive_ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+    // panel
+    let af = client.create_from_slice(f32::as_bytes(&a_f32));
+    let o2 = client.empty(m * n * 4);
+    let t1 = std::time::Instant::now();
+    for _ in 0..reps {
+        cubek_quant::qa_matmul::launch_panel::<TestRuntime>(
+            &client, af.clone(), wch.clone(), wsh.clone(), o2.clone(), m, n, k,
+        );
+    }
+    let _ = client.read_one(o2).unwrap();
+    let panel_ms = t1.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+    println!("QA {m}x{n}x{k}: naive {naive_ms:.3} ms/call, panel {panel_ms:.3} ms/call, speedup {:.1}x", naive_ms / panel_ms);
+}
+
+/// Weight-reuse panel QA matmul: f32 activations × dequant-on-the-fly TQ6 weights,
+/// one cube per N-column (W dequantized once). Validated vs a host oracle.
+#[test]
+fn test_qa_gemm_panel() {
+    let (m, n, k) = (40usize, 16usize, 64usize);
+    let units = k / 16;
+    let client = TestRuntime::client(&Default::default());
+
+    let mut s = 0x7777_3333_BEEFu64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let a: Vec<f32> = (0..m * k)
+        .map(|_| ((next() % 2000) as f32 / 1000.0) - 1.0)
+        .collect();
+    let w_code: Vec<u8> = (0..n * k).map(|_| (next() % 64) as u8).collect();
+    let w_scale: Vec<f16> = (0..n * units)
+        .map(|_| f16::from_f32(0.2 + (next() % 1000) as f32 / 2000.0))
+        .collect();
+    let mut w_words = Vec::<u32>::new();
+    for r in 0..n {
+        w_words.extend(pack_row(&w_code[r * k..(r + 1) * k]));
+    }
+
+    let mut oracle = vec![0.0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for c in 0..k {
+                let sw = w_scale[ni * units + c / 16].to_f32();
+                acc += a[mi * k + c] * Q6F[w_code[ni * k + c] as usize] * sw;
+            }
+            oracle[mi * n + ni] = acc;
+        }
+    }
+
+    let ah = client.create_from_slice(f32::as_bytes(&a));
+    let wh = client.create_from_slice(u32::as_bytes(&w_words));
+    let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
+    let outh = client.empty(m * n * 4);
+    cubek_quant::qa_matmul::launch_panel::<TestRuntime>(
+        &client, ah, wh, wsh, outh.clone(), m, n, k,
+    );
+    let got = f32::from_bytes(&client.read_one(outh).unwrap()).to_vec();
+
+    let cmax = oracle.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+    for (i, &g) in got.iter().enumerate() {
+        let diff = (g - oracle[i]).abs();
+        assert!(
+            diff <= 1e-4 * (1.0 + cmax),
+            "panel QA [{i}]: expected {} got {g} (diff {diff})",
+            oracle[i]
+        );
+    }
+}
+
 /// TQ6 QA matmul: both operands TQ6-quantized; C = dequant(A) @ dequant(W)^T.
 /// Validated against a CPU dequant-and-dot oracle.
 #[test]

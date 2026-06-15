@@ -76,6 +76,95 @@ fn qa_matmul_tq6_kernel(
     }
 }
 
+/// Weight-reuse tiled QA matmul: one cube per N-column dequantizes `W[col]`
+/// (the whole K) into shared memory ONCE, then all threads sweep the M rows
+/// against the cached column. Each weight row is dequantized exactly once
+/// (vs M·N times in [`qa_matmul_tq6_kernel`]); M-parallelism is the cube's
+/// thread count, which suits training-sized batches. Activations arrive
+/// pre-dequantized as f32 `[M, K]` (e.g. from `dequantize::launch_ref` on the
+/// TQ6 activation codes).
+#[cube(launch_unchecked)]
+fn qa_gemm_panel_kernel(
+    a: &[f32],       // [M, K] dequantized (prerot-space) activations
+    w_codes: &[u32], // [N, K] dense TQ6 weights
+    w_scales: &[f16],
+    out: &mut [f32], // [M, N]
+    #[comptime] m: u32,
+    #[comptime] n: u32,
+    #[comptime] k: u32,
+) {
+    let col = CUBE_POS_X as usize;
+    if col < n as usize {
+        let kk = k as usize;
+        let mm = m as usize;
+        let nn = n as usize;
+        let units = comptime!((k / 16) as usize);
+
+        let mut lut = Array::<f32>::new(64usize);
+        #[unroll]
+        for i in 0..64usize {
+            lut[i] = f32::new(comptime!(crate::codebook::centroid(QuantValue::Q6F, i)));
+        }
+
+        // dequant W[col] into shared, cooperatively (one unit per stride).
+        let mut w_col = Shared::<[f32]>::new_slice(k as usize);
+        let mut u = UNIT_POS as usize;
+        while u < units {
+            let w_base = (col * units + u) * 3;
+            let sw = f32::cast_from(w_scales[col * units + u]);
+            #[unroll]
+            for j in 0..16usize {
+                let wi = dense_code(w_codes, w_base, j);
+                w_col[u * 16 + j] = lut[wi as usize] * sw;
+            }
+            u += CUBE_DIM as usize;
+        }
+        sync_cube();
+
+        // sweep M rows against the cached column.
+        let mut row = UNIT_POS as usize;
+        while row < mm {
+            let mut acc = 0.0f32;
+            let a_base = row * kk;
+            for c in 0..kk {
+                acc += a[a_base + c] * w_col[c];
+            }
+            out[row * nn + col] = acc;
+            row += CUBE_DIM as usize;
+        }
+    }
+}
+
+/// Launch the weight-reuse QA matmul. `a` is f32 `[m, k]` (pre-dequantized
+/// activations); weights `[n, k]` are dense TQ6. One cube per output column.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_panel<R: Runtime>(
+    client: &ComputeClient<R>,
+    a: Handle,
+    w_codes: Handle,
+    w_scales: Handle,
+    out: Handle,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let units = k / 16;
+    unsafe {
+        qa_gemm_panel_kernel::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(n as u32, 1, 1),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(a, m * k),
+            BufferArg::from_raw_parts(w_codes, n * units * 3),
+            BufferArg::from_raw_parts(w_scales, n * units),
+            BufferArg::from_raw_parts(out, m * n),
+            m as u32,
+            n as u32,
+            k as u32,
+        );
+    }
+}
+
 /// Nearest TQ6 centroid index for `val` (sorted centroids → count of midpoint
 /// boundaries below `val`).
 #[cube]
