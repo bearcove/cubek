@@ -211,6 +211,7 @@ impl<Lhs: CubePrimitive, Rhs: CubePrimitive, Acc: CubePrimitive, A: BatchMatmulR
                 scale,
                 shape,
                 scheme,
+                codebook,
                 ..
             } => {
                 let (data_layout, scales_layout) = GlobalLayoutLaunch::from_quantized_handle(
@@ -228,7 +229,7 @@ impl<Lhs: CubePrimitive, Rhs: CubePrimitive, Acc: CubePrimitive, A: BatchMatmulR
                     scale.into_tensor_arg(),
                     scales_layout,
                 );
-                ViewArg::new_quantized(data_view, scales_view, scheme)
+                ViewArg::new_quantized(data_view, scales_view, scheme, codebook)
             }
         };
         let batch_layout = |handle: &InputBinding<R>| match handle {

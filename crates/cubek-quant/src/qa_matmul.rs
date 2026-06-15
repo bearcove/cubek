@@ -27,35 +27,12 @@ use cubecl::server::Handle;
 use core::hash::{Hash, Hasher};
 use half::f16;
 
-/// A codebook (centroid table) injected by the caller as a **comptime constant**:
-/// the values are baked straight into the shader, never a runtime buffer and
-/// never hardcoded in this fork. The caller (e.g. bee) owns the table and passes
-/// `Codebook(&ITS_TABLE)`; `value`'s `num_levels` decides how many entries are read.
-///
-/// `f32` is neither `Hash` nor `Eq` (NaN), so we hash/compare by bit pattern —
-/// fine for a fixed centroid table — which lets `Codebook` be a `#[comptime]` arg
-/// (the kernel cache keys on it).
-#[derive(Clone, Copy, Debug)]
-pub struct Codebook(pub &'static [f32]);
-
-impl PartialEq for Codebook {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len()
-            && self
-                .0
-                .iter()
-                .zip(other.0)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
-    }
-}
-impl Eq for Codebook {}
-impl Hash for Codebook {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        for v in self.0 {
-            v.to_bits().hash(state);
-        }
-    }
-}
+/// The codebook (centroid table) injected by the caller as a **comptime
+/// constant** — re-exported from `cubecl-common` so cubek-quant, cubecl-std and
+/// helix-burn all share the ONE `Codebook` type (no duplicate definitions). The
+/// caller (e.g. bee) owns the table and passes `Codebook(&ITS_TABLE)`; `value`'s
+/// `num_levels` decides how many entries are read.
+pub use cubecl_common::quant::scheme::Codebook;
 
 /// The 32-wide ±1 RHT sign pattern (the "prerot" rotation), injected by the
 /// caller as a **comptime constant** — baked into the shader, never a runtime

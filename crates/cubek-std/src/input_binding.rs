@@ -10,7 +10,7 @@ use cubecl::{
     quant::scheme::{BlockSize, QuantLevel},
     std::tensor::{into_contiguous_packed, into_contiguous_pitched},
 };
-use cubecl_common::quant::scheme::{QuantScheme, QuantStore, QuantValue};
+use cubecl_common::quant::scheme::{Codebook, QuantScheme, QuantStore, QuantValue};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -24,6 +24,9 @@ pub enum InputBinding<R: Runtime> {
         /// Unpacked shape, excluding padding
         shape: Shape,
         scheme: QuantScheme,
+        /// Comptime centroid table for [`cubecl_common::quant::scheme::QuantMode::Codebook`]
+        /// schemes; `Codebook(&[])` for symmetric schemes.
+        codebook: Codebook,
     },
 }
 
@@ -38,6 +41,7 @@ impl<R: Runtime> Clone for InputBinding<R> {
                 scale_dtype,
                 shape,
                 scheme,
+                codebook,
             } => Self::Quantized {
                 data: data.clone(),
                 data_dtype: *data_dtype,
@@ -45,6 +49,7 @@ impl<R: Runtime> Clone for InputBinding<R> {
                 scale_dtype: *scale_dtype,
                 shape: shape.clone(),
                 scheme: *scheme,
+                codebook: *codebook,
             },
         }
     }
@@ -68,6 +73,7 @@ impl<R: Runtime> InputBinding<R> {
                 scheme,
                 data_dtype: _,
                 scale_dtype: _,
+                codebook: _,
             } => {
                 let rank = data.shape.len();
 
@@ -99,6 +105,7 @@ impl<R: Runtime> InputBinding<R> {
             }
         }
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn quantized(
         data: TensorBinding<R>,
         scale: TensorBinding<R>,
@@ -106,6 +113,7 @@ impl<R: Runtime> InputBinding<R> {
         scheme: QuantScheme,
         data_dtype: StorageType,
         scale_dtype: StorageType,
+        codebook: Codebook,
     ) -> Self {
         Self::Quantized {
             data,
@@ -114,6 +122,7 @@ impl<R: Runtime> InputBinding<R> {
             scheme,
             data_dtype,
             scale_dtype,
+            codebook,
         }
     }
 
@@ -159,6 +168,13 @@ impl<R: Runtime> InputBinding<R> {
         }
     }
 
+    pub fn codebook(&self) -> Option<&Codebook> {
+        match self {
+            InputBinding::Normal(..) => None,
+            InputBinding::Quantized { codebook, .. } => Some(codebook),
+        }
+    }
+
     pub fn shape(&self) -> &Shape {
         match self {
             InputBinding::Normal(handle, ..) => &handle.shape,
@@ -179,6 +195,7 @@ impl<R: Runtime> InputBinding<R> {
                 scheme,
                 data_dtype,
                 scale_dtype,
+                codebook,
             } => {
                 let mut scheme = scheme;
                 let data = match scheme.store {
@@ -219,6 +236,7 @@ impl<R: Runtime> InputBinding<R> {
                     scheme,
                     data_dtype,
                     scale_dtype,
+                    codebook,
                 }
             }
         };
