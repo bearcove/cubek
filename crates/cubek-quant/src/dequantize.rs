@@ -189,6 +189,61 @@ fn unpack_codebook<F: Float, NF: Size, QS: Int>(
     output
 }
 
+/// Unpack a dense bit-packed unit into centroids: code `j` occupies bits
+/// `[j*size_bits, (j+1)*size_bits)` of the u32 stream starting at `base`. Codes
+/// straddle word boundaries, so reads are scalar u32 (vector_size 1, no vec
+/// padding) at comptime-derived word indices. `num_quants` codes out.
+#[cube]
+fn unpack_dense_codebook<F: Float, NF: Size>(
+    input: &LinearView<'_, Vector<u32, Const<1>>>,
+    base: usize,
+    #[comptime] scheme: QuantScheme,
+) -> Vector<F, NF> {
+    let bits = comptime!(scheme.value.size_bits());
+    let codes = comptime!(scheme.num_quants());
+    let mask = comptime!((1u32 << bits) - 1);
+    let levels = comptime!(1usize << bits);
+
+    let mut lut = Array::<F>::new(levels);
+    #[unroll]
+    for i in 0..levels {
+        lut[i] = F::new(comptime!(crate::codebook::centroid(scheme.value, i)));
+    }
+
+    let mut out = Vector::empty();
+    #[unroll]
+    for j in 0..codes {
+        let word = comptime!((j * bits) / 32);
+        let bitoff = comptime!((j * bits) % 32);
+        let lo = input.read(base + word).extract(0) >> comptime!(bitoff as u32);
+        let raw = if comptime!(bitoff + bits > 32) {
+            let hi = input.read(base + word + 1).extract(0) << comptime!((32 - bitoff) as u32);
+            (lo | hi) & mask
+        } else {
+            lo & mask
+        };
+        out.insert(j, lut[u32::cast_from(raw) as usize]);
+    }
+    out
+}
+
+#[cube(launch_unchecked, address_type = "dynamic")]
+fn dequantize_dense_kernel<F: Float, NF: Size, FS: Numeric>(
+    input: LinearView<'_, Vector<u32, Const<1>>>,
+    scales: ScalesView<'_, FS>,
+    mut output: LinearViewMut<'_, Vector<F, NF>>,
+    #[comptime] scheme: QuantScheme,
+    #[define(F, FS)] _dtypes: [StorageType; 2],
+) {
+    let base = ABSOLUTE_POS * comptime!(scheme.size_bits_stored() / 32);
+    if !input.is_in_bounds(base) {
+        terminate!();
+    }
+    let centroids = unpack_dense_codebook::<F, NF>(&input, base, scheme);
+    let scale = scales.read(ABSOLUTE_POS * comptime!(scheme.num_quants()));
+    output.write(ABSOLUTE_POS, dequantize_symmetric::<F, FS, NF>(centroids, scale));
+}
+
 #[cube(launch_unchecked, address_type = "dynamic")]
 fn dequantize_symmetric_packed_kernel<F: Float, NF: Size, FS: Numeric, QS: Int, NQ: Size>(
     input: LinearView<'_, Vector<QS, NQ>>,
@@ -258,6 +313,18 @@ pub fn launch_ref<R: Runtime>(
             store: QuantStore::PackedU32(_),
             ..
         } => dequantize_packed(
+            client,
+            input,
+            *scheme,
+            scale,
+            output,
+            output_dtype,
+            scale_dtype,
+        ),
+        QuantScheme {
+            store: QuantStore::PackedU32Dense(_),
+            ..
+        } => dequantize_dense(
             client,
             input,
             *scheme,
@@ -359,6 +426,48 @@ fn dequantize_packed<R: Runtime>(
             )
         },
         QuantScheme { .. } => panic!("Unsupported quantization scheme {scheme:?}"),
+    };
+
+    Ok(())
+}
+
+/// Dequantize densely bit-packed codes (e.g. TQ6). Each thread handles one
+/// dense unit: `words_per_unit` u32 in -> `codes_per_unit` floats out.
+fn dequantize_dense<R: Runtime>(
+    client: &ComputeClient<R>,
+    input: TensorBinding<R>,
+    scheme: QuantScheme,
+    scale: TensorBinding<R>,
+    output: TensorBinding<R>,
+    output_dtype: StorageType,
+    scale_dtype: StorageType,
+) -> Result<(), LaunchError> {
+    let input_dtype = packed_storage_elem(&scheme);
+    let words_per_unit = scheme.size_bits_stored() / 32;
+    let codes_per_unit = scheme.num_quants();
+    let num_u32: usize = input.shape.iter().product();
+    let num_units = num_u32 / words_per_unit;
+
+    let cube_dim = CubeDim::new(client, num_units);
+    let cube_count = calculate_cube_count_elemwise(client, num_units, cube_dim);
+    let address_type = input
+        .required_address_type(input_dtype.size())
+        .max(scale.required_address_type(scale_dtype.size()))
+        .max(output.required_address_type(output_dtype.size()));
+
+    unsafe {
+        dequantize_dense_kernel::launch_unchecked(
+            client,
+            cube_count,
+            cube_dim,
+            address_type,
+            codes_per_unit,
+            linear_view(input.clone()),
+            scales_view(input, scale, 1, &scheme),
+            linear_view(output),
+            scheme,
+            [output_dtype, scale_dtype],
+        )
     };
 
     Ok(())
