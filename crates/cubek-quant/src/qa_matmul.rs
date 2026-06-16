@@ -131,13 +131,22 @@ fn qa_matmul_kernel(
     }
 }
 
-/// Weight-reuse tiled QA matmul: one cube per N-column dequantizes `W[col]`
-/// (the whole K) into shared memory ONCE, then all threads sweep the M rows
-/// against the cached column. Each weight row is dequantized exactly once
-/// (vs M·N times in [`qa_matmul_kernel`]); M-parallelism is the cube's
-/// thread count, which suits training-sized batches. Activations arrive
-/// pre-dequantized as f32 `[M, K]` (e.g. from `dequantize::launch_ref` on the
-/// codebook activation codes).
+/// Weight-reuse QA matmul: one cube per N-column dequantizes `W[col]` (the whole
+/// K) into shared memory ONCE, then the WHOLE cube cooperates on each output
+/// `out[row,col] = a[row]·W[col]`. Activations arrive RAW `[M, K]` (f16/f32) and
+/// the forward-RHT (prerot) is applied in-kernel.
+///
+/// Two measured fixes over the original one-thread-per-row panel (which left
+/// 255/256 threads idle for the M=1 decode shape — occupancy 17%, latency-bound):
+///   1. **Codebook LUT lives in shared memory**, not a per-thread `Array`. A
+///      dynamically-indexed local array spills to local memory, so every centroid
+///      lookup was a scattered L2 load (the ncu bottleneck). One shared copy per
+///      cube keeps all lookups on-chip.
+///   2. **The K-reduction is cube-cooperative**: every row's dot is split across
+///      all 256 threads and reduced (warp `plane_sum` → shared scratch → thread
+///      0). For the RHT path the per-32-block Walsh–Hadamard is done by one WARP
+///      (lane = element, butterfly via `plane_shuffle_xor`) — no local `buf[32]`,
+///      so the whole prerot+dot stays in registers + shared.
 #[cube(launch_unchecked)]
 fn qa_gemm_panel_kernel<F: Float>(
     a: &[F],         // [M, K] RAW activations (f16/f32), forward-RHT applied in-kernel
@@ -162,11 +171,23 @@ fn qa_gemm_panel_kernel<F: Float>(
         let wpu = comptime!(words_per_unit(value));
         let levels = comptime!(crate::codebook::num_levels(value));
 
-        let mut lut = Array::<f32>::new(levels);
-        #[unroll]
-        for i in 0..levels {
-            lut[i] = f32::new(comptime!(codebook.0[i]));
+        // --- shared codebook LUT (one copy per cube; thread 0 bakes constants) ---
+        let mut lut = Shared::<[f32]>::new_slice(levels);
+        // --- shared ±1 RHT sign pattern (32-wide), indexable by runtime lane ---
+        let mut signs = Shared::<[f32]>::new_slice(32);
+        if UNIT_POS == 0 {
+            #[unroll]
+            for i in 0..levels {
+                lut[i] = f32::new(comptime!(codebook.0[i]));
+            }
+            if comptime!(rht_signs.0.len() > 0) {
+                #[unroll]
+                for i in 0..32usize {
+                    signs[i] = f32::new(comptime!(rht_signs.0[i]));
+                }
+            }
         }
+        sync_cube();
 
         // dequant W[col] into shared, cooperatively (one unit per stride).
         let mut w_col = Shared::<[f32]>::new_slice(k as usize);
@@ -183,54 +204,67 @@ fn qa_gemm_panel_kernel<F: Float>(
         }
         sync_cube();
 
-        // sweep M rows against the cached column. A non-empty `rht_signs` selects
-        // bee's `matvec_prerot`: the weight column is stored in prerot (RHT) space,
-        // so we forward-RHT each 32-block of the activation row (sign → Walsh–
-        // Hadamard → 1/√32) before the dot. An empty `RhtSigns(&[])` is the plain
-        // panel matmul (activation already in the matching space).
-        let mut row = UNIT_POS as usize;
-        while row < mm {
-            let mut acc = 0.0f32;
+        // cross-warp reduction scratch (one slot per warp; ≤ 256/min-plane).
+        let mut scratch = Shared::<[f32]>::new_slice(32);
+        let lane = UNIT_POS_PLANE;
+        let warp = UNIT_POS / PLANE_DIM;
+        let n_warps = CUBE_DIM / PLANE_DIM;
+
+        // sweep M rows against the cached column, the whole cube cooperating per
+        // row. A non-empty `rht_signs` selects bee's `matvec_prerot`: the weight
+        // column is stored in prerot (RHT) space, so each 32-block of the
+        // activation row is forward-RHT'd (sign → Walsh–Hadamard → 1/√32) before
+        // the dot. An empty `RhtSigns(&[])` is the plain panel matmul.
+        for row in 0..mm {
             let a_base = row * kk;
+            let mut acc = 0.0f32;
             if comptime!(rht_signs.0.len() > 0) {
+                // each WARP owns whole 32-blocks (lane = element within the block).
                 let nblk = kk / 32;
-                let mut blk = 0usize;
+                let mut blk = warp as usize;
                 while blk < nblk {
                     let blk_base = a_base + blk * 32;
-                    let mut buf = Array::<f32>::new(32usize);
-                    #[unroll]
-                    for j in 0..32usize {
-                        buf[j] = f32::cast_from(a[blk_base + j]) * comptime!(rht_signs.0[j]);
-                    }
-                    let mut step = 1usize;
-                    while step < 32 {
-                        let span = step * 2;
-                        let mut q = 0usize;
-                        while q < 32 {
-                            for idx in q..q + step {
-                                let lo = buf[idx];
-                                let hi = buf[idx + step];
-                                buf[idx] = lo + hi;
-                                buf[idx + step] = lo - hi;
-                            }
-                            q += span;
+                    let mut v = f32::cast_from(a[blk_base + lane as usize]) * signs[lane as usize];
+                    // length-32 Walsh–Hadamard butterfly across the warp lanes:
+                    // pair (l, l^mask); low lane → v+p, high lane → p-v.
+                    let mut mask = 1u32;
+                    while mask < 32 {
+                        let p = plane_shuffle_xor(v, mask);
+                        if (lane & mask) == 0 {
+                            v = v + p;
+                        } else {
+                            v = p - v;
                         }
-                        step *= 2;
+                        mask *= 2;
                     }
-                    #[unroll]
-                    for j in 0..32usize {
-                        acc +=
-                            buf[j] * comptime!(crate::codebook::INV_SQRT32) * w_col[blk * 32 + j];
-                    }
-                    blk += 1;
+                    acc += v
+                        * comptime!(crate::codebook::INV_SQRT32)
+                        * w_col[blk * 32 + lane as usize];
+                    blk += n_warps as usize;
                 }
             } else {
-                for c in 0..kk {
+                // plain dot: each thread strides over K, reduced below.
+                let mut c = UNIT_POS as usize;
+                while c < kk {
                     acc += f32::cast_from(a[a_base + c]) * w_col[c];
+                    c += CUBE_DIM as usize;
                 }
             }
-            out[row * nn + col] = acc;
-            row += CUBE_DIM as usize;
+
+            // warp-reduce, then cross-warp via shared scratch, then thread 0 writes.
+            let warp_total = plane_sum(acc);
+            if lane == 0 {
+                scratch[warp as usize] = warp_total;
+            }
+            sync_cube();
+            if UNIT_POS == 0 {
+                let mut tot = 0.0f32;
+                for w in 0..n_warps as usize {
+                    tot += scratch[w];
+                }
+                out[row * nn + col] = tot;
+            }
+            sync_cube();
         }
     }
 }
