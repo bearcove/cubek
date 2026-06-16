@@ -151,7 +151,9 @@ fn qa_gemm_panel_kernel(
     #[comptime] k: u32,
     #[comptime] value: QuantValue,
 ) {
-    let col = CUBE_POS_X as usize;
+    // One cube per output column. `n` can exceed the 65535 grid-dim cap (e.g. the
+    // LM head, n = vocab), so columns are laid out across a 2D grid.
+    let col = (CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) as usize;
     if col < n as usize {
         let kk = k as usize;
         let mm = m as usize;
@@ -254,10 +256,13 @@ pub fn launch_panel<R: Runtime>(
 ) {
     let units = k / 16;
     let wpu = words_per_unit(value);
+    // Lay `n` output columns across a 2D grid: each grid dim is capped at 65535.
+    let grid_x = n.min(65535);
+    let grid_y = n.div_ceil(grid_x);
     unsafe {
         qa_gemm_panel_kernel::launch_unchecked::<R>(
             client,
-            CubeCount::Static(n as u32, 1, 1),
+            CubeCount::Static(grid_x as u32, grid_y as u32, 1),
             CubeDim::new_1d(256),
             BufferArg::from_raw_parts(a, m * k),
             BufferArg::from_raw_parts(w_codes, n * units * wpu),
