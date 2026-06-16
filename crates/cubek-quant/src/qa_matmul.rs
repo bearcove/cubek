@@ -78,6 +78,25 @@ fn dense_code(codes: &[u32], base: usize, #[comptime] j: usize, #[comptime] valu
     }
 }
 
+/// Runtime-`j` variant of [`dense_code`]: extract code `j` (0-based within a
+/// 16-code unit) when `j` comes from a runtime value (e.g. the warp lane in the
+/// GEMV kernel). `bits` is comptime so the mask folds, but the word index, bit
+/// offset and the straddle test are runtime.
+#[cube]
+fn dense_code_dyn(codes: &[u32], base: usize, j: u32, #[comptime] value: QuantValue) -> u32 {
+    let bits = comptime!(value.size_bits() as u32);
+    let mask = comptime!((1u32 << value.size_bits()) - 1);
+    let bitpos = j * bits;
+    let word = (bitpos / 32) as usize;
+    let off = bitpos % 32;
+    let lo = codes[base + word] >> off;
+    if off + bits > 32 {
+        (lo | (codes[base + word + 1] << (32u32 - off))) & mask
+    } else {
+        lo & mask
+    }
+}
+
 /// `bits·16/32` — u32 per 16-code (half-block) dense unit. Comptime helper.
 fn words_per_unit(value: QuantValue) -> usize {
     value.size_bits() * 16 / 32
@@ -269,6 +288,106 @@ fn qa_gemm_panel_kernel<F: Float>(
     }
 }
 
+/// Decode GEMV (M = 1): **one warp per output column** — bee's Metal
+/// `tq6_1s_matvec_prerot` shape. A cube holds `CUBE_DIM/PLANE_DIM` warps and
+/// handles that many columns; lane = element within the 32-block, the K-dot is a
+/// single `plane_sum` per warp, and the weight is dequantized straight on read
+/// (no `w_col` staging — there is no row reuse at M=1, so staging would only add
+/// a shared round-trip, which `qa_gemm_panel_kernel` showed becomes the L1/TEX
+/// bottleneck). The forward-RHT'd activation is staged ONCE into shared per cube
+/// and reused across the cube's columns (the `tile_wide` trick), so the butterfly
+/// runs `CUBE_DIM/PLANE_DIM`× fewer times than a per-column in-line RHT.
+#[cube(launch_unchecked)]
+fn qa_gemv_kernel<F: Float>(
+    a: &[F],         // [1, K] RAW activation (forward-RHT applied in-kernel)
+    w_codes: &[u32], // [N, K] dense codebook weights (rotated, packed)
+    w_scales: &[f16],
+    out: &mut [f32], // [1, N]
+    #[comptime] codebook: Codebook,
+    #[comptime] rht_signs: RhtSigns,
+    #[comptime] n: u32,
+    #[comptime] k: u32,
+    #[comptime] value: QuantValue,
+) {
+    let kk = k as usize;
+    let nn = n as usize;
+    let units = comptime!((k / 16) as usize);
+    let wpu = comptime!(words_per_unit(value));
+    let levels = comptime!(crate::codebook::num_levels(value));
+    let nblk = comptime!((k / 32) as usize);
+
+    let lane = UNIT_POS_PLANE;
+    let warp = UNIT_POS / PLANE_DIM;
+    let n_warps = CUBE_DIM / PLANE_DIM;
+    let col = ((CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * n_warps + warp) as usize;
+
+    // shared LUT, shared ±1 signs, and the staged (RHT'd) activation row.
+    let mut lut = Shared::<[f32]>::new_slice(levels);
+    let mut signs = Shared::<[f32]>::new_slice(32usize);
+    let mut a_sh = Shared::<[f32]>::new_slice(k as usize);
+    if UNIT_POS == 0 {
+        #[unroll]
+        for i in 0..levels {
+            lut[i] = f32::new(comptime!(codebook.0[i]));
+        }
+        if comptime!(rht_signs.0.len() > 0) {
+            #[unroll]
+            for i in 0..32usize {
+                signs[i] = f32::new(comptime!(rht_signs.0[i]));
+            }
+        }
+    }
+    sync_cube();
+
+    // stage the activation row once per cube: forward-RHT per 32-block (warp =
+    // block, lane = element, butterfly via plane_shuffle_xor) or a plain copy.
+    if comptime!(rht_signs.0.len() > 0) {
+        let mut blk = warp as usize;
+        while blk < nblk {
+            let mut v = f32::cast_from(a[blk * 32 + lane as usize]) * signs[lane as usize];
+            let mut mask = 1u32;
+            while mask < 32 {
+                let p = plane_shuffle_xor(v, mask);
+                if (lane & mask) == 0 {
+                    v = v + p;
+                } else {
+                    v = p - v;
+                }
+                mask *= 2;
+            }
+            a_sh[blk * 32 + lane as usize] = v * comptime!(crate::codebook::INV_SQRT32);
+            blk += n_warps as usize;
+        }
+    } else {
+        let mut i = UNIT_POS as usize;
+        while i < kk {
+            a_sh[i] = f32::cast_from(a[i]);
+            i += CUBE_DIM as usize;
+        }
+    }
+    sync_cube();
+
+    // each warp dots its column against the staged activation, dequant-on-read.
+    if col < nn {
+        let mut partial = 0.0f32;
+        let mut blk = 0usize;
+        while blk < nblk {
+            let p = blk * 32 + lane as usize; // element index in K
+            let unit = p / 16; // half-block unit (own fp16 scale)
+            let jj = (p % 16) as u32; // code index within the unit
+            let base = (col * units + unit) * wpu;
+            let code = dense_code_dyn(w_codes, base, jj, value);
+            let sw = f32::cast_from(w_scales[col * units + unit]);
+            partial += lut[code as usize] * sw * a_sh[p];
+            blk += 1;
+        }
+        let total = plane_sum(partial);
+        if lane == 0 {
+            out[col] = total;
+        }
+    }
+}
+
 /// Launch the weight-reuse QA matmul. `a` is f32 `[m, k]` (pre-dequantized
 /// activations); weights `[n, k]` are dense codebook codes for `value`. One cube
 /// per output column. `codebook` is the centroid table for `value` (length
@@ -290,6 +409,31 @@ pub fn launch_panel<R: Runtime, F: Float>(
 ) {
     let units = k / 16;
     let wpu = words_per_unit(value);
+    // Decode (M = 1): the warp-per-column GEMV — no row reuse, so dequant-on-read
+    // beats the panel's w_col staging. A cube of 256 threads = 8 warps = 8 cols.
+    if m == 1 {
+        const WARPS: usize = 8; // CubeDim 256 / warp 32 (CUDA)
+        let cubes = n.div_ceil(WARPS);
+        let grid_x = cubes.min(65535);
+        let grid_y = cubes.div_ceil(grid_x);
+        unsafe {
+            qa_gemv_kernel::launch_unchecked::<F, R>(
+                client,
+                CubeCount::Static(grid_x as u32, grid_y as u32, 1),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(a, m * k),
+                BufferArg::from_raw_parts(w_codes, n * units * wpu),
+                BufferArg::from_raw_parts(w_scales, n * units),
+                BufferArg::from_raw_parts(out, m * n),
+                codebook,
+                rht_signs,
+                n as u32,
+                k as u32,
+                value,
+            );
+        }
+        return;
+    }
     // Lay `n` output columns across a 2D grid: each grid dim is capped at 65535.
     let grid_x = n.min(65535);
     let grid_y = n.div_ceil(grid_x);
