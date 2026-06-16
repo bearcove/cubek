@@ -139,8 +139,8 @@ fn qa_matmul_kernel(
 /// pre-dequantized as f32 `[M, K]` (e.g. from `dequantize::launch_ref` on the
 /// codebook activation codes).
 #[cube(launch_unchecked)]
-fn qa_gemm_panel_kernel(
-    a: &[f32],       // [M, K] RAW activations (forward-RHT applied in-kernel)
+fn qa_gemm_panel_kernel<F: Float>(
+    a: &[F],         // [M, K] RAW activations (f16/f32), forward-RHT applied in-kernel
     w_codes: &[u32], // [N, K] dense codebook weights (rotated, packed)
     w_scales: &[f16],
     out: &mut [f32], // [M, N]
@@ -200,7 +200,7 @@ fn qa_gemm_panel_kernel(
                     let mut buf = Array::<f32>::new(32usize);
                     #[unroll]
                     for j in 0..32usize {
-                        buf[j] = a[blk_base + j] * comptime!(rht_signs.0[j]);
+                        buf[j] = f32::cast_from(a[blk_base + j]) * comptime!(rht_signs.0[j]);
                     }
                     let mut step = 1usize;
                     while step < 32 {
@@ -226,7 +226,7 @@ fn qa_gemm_panel_kernel(
                 }
             } else {
                 for c in 0..kk {
-                    acc += a[a_base + c] * w_col[c];
+                    acc += f32::cast_from(a[a_base + c]) * w_col[c];
                 }
             }
             out[row * nn + col] = acc;
@@ -241,7 +241,7 @@ fn qa_gemm_panel_kernel(
 /// `crate::codebook::num_levels(value)`).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-pub fn launch_panel<R: Runtime>(
+pub fn launch_panel<R: Runtime, F: Float>(
     client: &ComputeClient<R>,
     value: QuantValue,
     a: Handle,
@@ -260,7 +260,7 @@ pub fn launch_panel<R: Runtime>(
     let grid_x = n.min(65535);
     let grid_y = n.div_ceil(grid_x);
     unsafe {
-        qa_gemm_panel_kernel::launch_unchecked::<R>(
+        qa_gemm_panel_kernel::launch_unchecked::<F, R>(
             client,
             CubeCount::Static(grid_x as u32, grid_y as u32, 1),
             CubeDim::new_1d(256),
