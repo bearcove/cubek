@@ -174,7 +174,7 @@ fn qa_gemm_panel_kernel<F: Float>(
         // --- shared codebook LUT (one copy per cube; thread 0 bakes constants) ---
         let mut lut = Shared::<[f32]>::new_slice(levels);
         // --- shared ±1 RHT sign pattern (32-wide), indexable by runtime lane ---
-        let mut signs = Shared::<[f32]>::new_slice(32);
+        let mut signs = Shared::<[f32]>::new_slice(32usize);
         if UNIT_POS == 0 {
             #[unroll]
             for i in 0..levels {
@@ -205,7 +205,7 @@ fn qa_gemm_panel_kernel<F: Float>(
         sync_cube();
 
         // cross-warp reduction scratch (one slot per warp; ≤ 256/min-plane).
-        let mut scratch = Shared::<[f32]>::new_slice(32);
+        let mut scratch = Shared::<[f32]>::new_slice(32usize);
         let lane = UNIT_POS_PLANE;
         let warp = UNIT_POS / PLANE_DIM;
         let n_warps = CUBE_DIM / PLANE_DIM;
