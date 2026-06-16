@@ -140,11 +140,12 @@ fn qa_matmul_kernel(
 /// codebook activation codes).
 #[cube(launch_unchecked)]
 fn qa_gemm_panel_kernel(
-    a: &[f32],       // [M, K] dequantized (prerot-space) activations
-    w_codes: &[u32], // [N, K] dense codebook weights
+    a: &[f32],       // [M, K] RAW activations (forward-RHT applied in-kernel)
+    w_codes: &[u32], // [N, K] dense codebook weights (rotated, packed)
     w_scales: &[f16],
     out: &mut [f32], // [M, N]
     #[comptime] codebook: Codebook,
+    #[comptime] rht_signs: RhtSigns,
     #[comptime] m: u32,
     #[comptime] n: u32,
     #[comptime] k: u32,
@@ -180,13 +181,51 @@ fn qa_gemm_panel_kernel(
         }
         sync_cube();
 
-        // sweep M rows against the cached column.
+        // sweep M rows against the cached column. A non-empty `rht_signs` selects
+        // bee's `matvec_prerot`: the weight column is stored in prerot (RHT) space,
+        // so we forward-RHT each 32-block of the activation row (sign → Walsh–
+        // Hadamard → 1/√32) before the dot. An empty `RhtSigns(&[])` is the plain
+        // panel matmul (activation already in the matching space).
         let mut row = UNIT_POS as usize;
         while row < mm {
             let mut acc = 0.0f32;
             let a_base = row * kk;
-            for c in 0..kk {
-                acc += a[a_base + c] * w_col[c];
+            if comptime!(rht_signs.0.len() > 0) {
+                let nblk = kk / 32;
+                let mut blk = 0usize;
+                while blk < nblk {
+                    let blk_base = a_base + blk * 32;
+                    let mut buf = Array::<f32>::new(32usize);
+                    #[unroll]
+                    for j in 0..32usize {
+                        buf[j] = a[blk_base + j] * comptime!(rht_signs.0[j]);
+                    }
+                    let mut step = 1usize;
+                    while step < 32 {
+                        let span = step * 2;
+                        let mut q = 0usize;
+                        while q < 32 {
+                            for idx in q..q + step {
+                                let lo = buf[idx];
+                                let hi = buf[idx + step];
+                                buf[idx] = lo + hi;
+                                buf[idx + step] = lo - hi;
+                            }
+                            q += span;
+                        }
+                        step *= 2;
+                    }
+                    #[unroll]
+                    for j in 0..32usize {
+                        acc +=
+                            buf[j] * comptime!(crate::codebook::INV_SQRT32) * w_col[blk * 32 + j];
+                    }
+                    blk += 1;
+                }
+            } else {
+                for c in 0..kk {
+                    acc += a[a_base + c] * w_col[c];
+                }
             }
             out[row * nn + col] = acc;
             row += CUBE_DIM as usize;
@@ -199,6 +238,7 @@ fn qa_gemm_panel_kernel(
 /// per output column. `codebook` is the centroid table for `value` (length
 /// `crate::codebook::num_levels(value)`).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn launch_panel<R: Runtime>(
     client: &ComputeClient<R>,
     value: QuantValue,
@@ -206,6 +246,7 @@ pub fn launch_panel<R: Runtime>(
     w_codes: Handle,
     w_scales: Handle,
     codebook: Codebook,
+    rht_signs: RhtSigns,
     out: Handle,
     m: usize,
     n: usize,
@@ -223,6 +264,7 @@ pub fn launch_panel<R: Runtime>(
             BufferArg::from_raw_parts(w_scales, n * units),
             BufferArg::from_raw_parts(out, m * n),
             codebook,
+            rht_signs,
             m as u32,
             n as u32,
             k as u32,

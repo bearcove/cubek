@@ -381,7 +381,17 @@ fn bench_qa_panel_vs_naive() {
     let t1 = std::time::Instant::now();
     for _ in 0..reps {
         cubek_quant::qa_matmul::launch_panel::<TestRuntime>(
-            &client, value, af.clone(), wch.clone(), wsh.clone(), cb, o2.clone(), m, n, k,
+            &client,
+            value,
+            af.clone(),
+            wch.clone(),
+            wsh.clone(),
+            cb,
+            cubek_quant::qa_matmul::RhtSigns(&[]),
+            o2.clone(),
+            m,
+            n,
+            k,
         );
     }
     let _ = client.read_one(o2).unwrap();
@@ -436,7 +446,17 @@ fn test_qa_gemm_panel() {
     let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
     let outh = client.empty(m * n * 4);
     cubek_quant::qa_matmul::launch_panel::<TestRuntime>(
-        &client, value, ah, wh, wsh, cb, outh.clone(), m, n, k,
+        &client,
+        value,
+        ah,
+        wh,
+        wsh,
+        cb,
+        cubek_quant::qa_matmul::RhtSigns(&[]),
+        outh.clone(),
+        m,
+        n,
+        k,
     );
     let got = f32::from_bytes(&client.read_one(outh).unwrap()).to_vec();
 
