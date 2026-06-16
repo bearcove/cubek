@@ -380,7 +380,7 @@ fn bench_qa_panel_vs_naive() {
     let o2 = client.empty(m * n * 4);
     let t1 = std::time::Instant::now();
     for _ in 0..reps {
-        cubek_quant::qa_matmul::launch_panel::<TestRuntime>(
+        cubek_quant::qa_matmul::launch_panel::<TestRuntime, f32>(
             &client,
             value,
             af.clone(),
@@ -445,7 +445,7 @@ fn test_qa_gemm_panel() {
     let wh = client.create_from_slice(u32::as_bytes(&w_words));
     let wsh = client.create_from_slice(f16::as_bytes(&w_scale));
     let outh = client.empty(m * n * 4);
-    cubek_quant::qa_matmul::launch_panel::<TestRuntime>(
+    cubek_quant::qa_matmul::launch_panel::<TestRuntime, f32>(
         &client,
         value,
         ah,
