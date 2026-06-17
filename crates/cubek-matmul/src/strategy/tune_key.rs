@@ -98,17 +98,6 @@ impl MatmulAutotuneKey {
         let k = lhs_shape[ndims - 1];
         let n = rhs_shape[ndims - 1];
 
-        // TEMP PROBE (remove): backtrace the distill_kv pathological matmul (k≈262144) at
-        // its generation site to find which autodiff backward builds it.
-        if m.max(k).max(n) >= 100_000 {
-            std::eprintln!(
-                "[KEY-PROBE] matmul m={m} n={n} k={k} lhs={:?} rhs={:?}\n{}",
-                lhs_shape,
-                rhs_shape,
-                std::backtrace::Backtrace::force_capture()
-            );
-        }
-
         let matrix_layout_lhs = matrix_batch_layout(lhs_strides, lhs_scheme);
         let matrix_layout_rhs = matrix_batch_layout(rhs_strides, rhs_scheme);
 
