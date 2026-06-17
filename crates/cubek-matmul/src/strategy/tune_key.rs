@@ -98,18 +98,6 @@ impl MatmulAutotuneKey {
         let k = lhs_shape[ndims - 1];
         let n = rhs_shape[ndims - 1];
 
-        // TEMP PROBE (remove): backtrace the distill_kv pathological matmul key at its
-        // generation site (the build finally compiles this in — earlier probe builds were
-        // silently failing on an unrelated cubecl create_external break).
-        if m.max(k).max(n) >= 100_000 {
-            std::eprintln!(
-                "[KEY-PROBE] matmul key m={m} n={n} k={k} lhs_shape={:?} rhs_shape={:?}\n{}",
-                lhs_shape,
-                rhs_shape,
-                std::backtrace::Backtrace::force_capture()
-            );
-        }
-
         let matrix_layout_lhs = matrix_batch_layout(lhs_strides, lhs_scheme);
         let matrix_layout_rhs = matrix_batch_layout(rhs_strides, rhs_scheme);
 
