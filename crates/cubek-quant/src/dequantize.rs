@@ -415,11 +415,6 @@ fn dequantize_packed<R: Runtime>(
     if !output.shape[rank - 1].is_multiple_of(vector_size_out) {
         vector_size_in = 1;
     }
-    // DIAGNOSTIC: force scalar packed reads to isolate a vectorized-load codegen
-    // bug (Metal4 audio-encoder dequant NaN). Remove once root cause is known.
-    if std::env::var("DEQUANT_VS1").is_ok() {
-        vector_size_in = 1;
-    }
 
     let num_elems = num_elems_input / vector_size_in as usize;
     let cube_dim = CubeDim::new(client, num_elems);
