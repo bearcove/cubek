@@ -98,6 +98,18 @@ impl MatmulAutotuneKey {
         let k = lhs_shape[ndims - 1];
         let n = rhs_shape[ndims - 1];
 
+        // TEMP PROBE (remove): the distill_kv autodiff+fusion corruption surfaces here as a
+        // matmul with a pathological dim (garbage shape read from a freed/reused handle).
+        // Dump lhs/rhs shapes + a backtrace at the key-generation site to find the origin.
+        if m.max(k).max(n) >= 200_000 {
+            std::eprintln!(
+                "[KEY-PROBE] matmul key m={m} n={n} k={k} lhs_shape={:?} rhs_shape={:?}\n{}",
+                lhs_shape,
+                rhs_shape,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+
         let matrix_layout_lhs = matrix_batch_layout(lhs_strides, lhs_scheme);
         let matrix_layout_rhs = matrix_batch_layout(rhs_strides, rhs_scheme);
 
