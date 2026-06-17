@@ -18,7 +18,8 @@ use crate::{
         stage::NumStages,
     },
     definition::{
-        CubeMappingLaunch, MatmulElems, MatmulProblem, MatmulSetupError, MatmulVectorSizes,
+        CubeMappingLaunch, MatmulAvailabilityError, MatmulElems, MatmulProblem, MatmulSetupError,
+        MatmulVectorSizes,
     },
     routines::{
         BatchMatmulRoutine, BlueprintStrategy, DeviceSettings, ExpandInfo, LaunchInfo, Routine,
@@ -134,6 +135,21 @@ impl BatchMatmulRoutine<()> for GemmRoutine {
 
                 let kind = MatmulOperandLayouts::from_problem(problem)?;
                 let variant = kind.variant();
+
+                // OuterM / OuterN are outer-product variants that do not reduce across the
+                // units of a plane: they are only runnable when `plane_dim == 1` (CPU). On a
+                // GPU (`plane_dim > 1`) the sole runnable variant is `Dot`. Decline here so
+                // this routine is cleanly skipped as an autotune candidate, instead of
+                // building a blueprint that `validate_blueprint` would only reject at launch
+                // — which, for a winner reused from the cache, would panic the process.
+                if device_settings.plane_dim > 1 && !matches!(variant, Variant::Dot) {
+                    return Err(MatmulSetupError::Unavailable(
+                        MatmulAvailabilityError::PlaneDimUnsupported {
+                            plane_dim: device_settings.plane_dim,
+                        },
+                    ));
+                }
+
                 let planes_split = variant.planes_split();
                 let vector_size = device_settings.vector_sizes.lhs;
 
