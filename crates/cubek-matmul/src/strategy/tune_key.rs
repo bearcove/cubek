@@ -98,27 +98,6 @@ impl MatmulAutotuneKey {
         let k = lhs_shape[ndims - 1];
         let n = rhs_shape[ndims - 1];
 
-        // TEMP PROBE (remove): confirm this fn is reached + catch the pathological dim.
-        // Print the first few keys unconditionally (proves the probe is compiled/reached),
-        // and a backtrace for any pathological dim (the distill_kv corruption origin).
-        {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let huge = m.max(k).max(n) >= 100_000;
-            let first = N.fetch_add(1, Ordering::Relaxed) < 5;
-            if first || huge {
-                std::eprintln!("[KEY-PROBE] matmul key m={m} n={n} k={k} huge={huge}");
-                if huge {
-                    std::eprintln!(
-                        "[KEY-PROBE-BT] lhs_shape={:?} rhs_shape={:?}\n{}",
-                        lhs_shape,
-                        rhs_shape,
-                        std::backtrace::Backtrace::force_capture()
-                    );
-                }
-            }
-        }
-
         let matrix_layout_lhs = matrix_batch_layout(lhs_strides, lhs_scheme);
         let matrix_layout_rhs = matrix_batch_layout(rhs_strides, rhs_scheme);
 
