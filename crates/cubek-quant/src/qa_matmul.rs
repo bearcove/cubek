@@ -310,7 +310,6 @@ fn qa_gemv_kernel<F: Float>(
     #[comptime] k: u32,
     #[comptime] value: QuantValue,
     #[comptime] do_norm: bool, // fold input_ln/post_ln RMSNorm into the gemv
-    #[comptime] eps: f32,
 ) {
     let kk = k as usize;
     let nn = n as usize;
@@ -370,7 +369,7 @@ fn qa_gemv_kernel<F: Float>(
                 tot += ss_sh[w];
                 w += 1;
             }
-            ss_sh[0] = tot / (k as f32) + eps; // mean-square + eps (reuse slot 0)
+            ss_sh[0] = tot / (k as f32) + 1.0e-6f32; // mean-square + eps (reuse slot 0)
         }
         sync_cube();
         s = ss_sh[0].sqrt().recip();
@@ -459,7 +458,7 @@ pub fn launch_panel<R: Runtime, F: Float>(
     // dummy handle). `eps` is the RMSNorm epsilon.
     gamma: Handle,
     do_norm: bool,
-    eps: f32,
+    _eps: f32, // RMSNorm eps is the fixed model 1e-6, hardcoded in the kernel
 ) {
     debug_assert!(!do_norm || m == 1, "in-kernel RMSNorm fold only supports the m==1 gemv");
     let units = k / 16;
@@ -487,7 +486,6 @@ pub fn launch_panel<R: Runtime, F: Float>(
                 k as u32,
                 value,
                 do_norm,
-                eps,
             );
         }
         return;
