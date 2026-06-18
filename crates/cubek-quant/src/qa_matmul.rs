@@ -299,15 +299,18 @@ fn qa_gemm_panel_kernel<F: Float>(
 /// runs `CUBE_DIM/PLANE_DIM`× fewer times than a per-column in-line RHT.
 #[cube(launch_unchecked)]
 fn qa_gemv_kernel<F: Float>(
-    a: &[F],         // [1, K] RAW activation (forward-RHT applied in-kernel)
+    a: &[F],         // [1, K] RAW activation (RMSNorm + forward-RHT applied in-kernel)
     w_codes: &[u32], // [N, K] dense codebook weights (rotated, packed)
     w_scales: &[f16],
     out: &mut [f32], // [1, N]
+    gamma: &[F],     // [K] RMSNorm gamma (only read when do_norm; dummy otherwise)
     #[comptime] codebook: Codebook,
     #[comptime] rht_signs: RhtSigns,
     #[comptime] n: u32,
     #[comptime] k: u32,
     #[comptime] value: QuantValue,
+    #[comptime] do_norm: bool, // fold input_ln/post_ln RMSNorm into the gemv
+    #[comptime] eps: f32,
 ) {
     let kk = k as usize;
     let nn = n as usize;
@@ -321,10 +324,12 @@ fn qa_gemv_kernel<F: Float>(
     let n_warps = CUBE_DIM / PLANE_DIM;
     let col = ((CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * n_warps + warp) as usize;
 
-    // shared LUT, shared ±1 signs, and the staged (RHT'd) activation row.
+    // shared LUT, shared ±1 signs, the staged (RHT'd) activation row, and per-warp
+    // scratch for the in-kernel RMSNorm reduction.
     let mut lut = Shared::<[f32]>::new_slice(levels);
     let mut signs = Shared::<[f32]>::new_slice(32usize);
     let mut a_sh = Shared::<[f32]>::new_slice(k as usize);
+    let mut ss_sh = Shared::<[f32]>::new_slice(32usize);
     if UNIT_POS == 0 {
         #[unroll]
         for i in 0..levels {
@@ -339,33 +344,76 @@ fn qa_gemv_kernel<F: Float>(
     }
     sync_cube();
 
-    // stage the activation row once per cube: forward-RHT per 32-block (warp =
-    // block, lane = element, butterfly via plane_shuffle_xor) or a plain copy.
-    if comptime!(rht_signs.0.len() > 0) {
+    // Per-row RMSNorm scale s = rsqrt(mean(h²)+eps); applied to the output column at
+    // the end since it factors out of the linear dot. 1.0 when !do_norm.
+    let mut s = 1.0f32;
+    if comptime!(do_norm) {
+        // Pass 1: accumulate Σh² and stage h⊙gamma into a_sh.
+        let mut ss = 0.0f32;
+        let mut i = UNIT_POS as usize;
+        while i < kk {
+            let hi = f32::cast_from(a[i]);
+            ss += hi * hi;
+            a_sh[i] = hi * f32::cast_from(gamma[i]);
+            i += CUBE_DIM as usize;
+        }
+        // Cross-warp reduce Σh²: warp plane_sum → per-warp shared → thread 0 sums.
+        let wsum = plane_sum(ss);
+        if lane == 0 {
+            ss_sh[warp as usize] = wsum;
+        }
+        sync_cube();
+        if UNIT_POS == 0 {
+            let mut tot = 0.0f32;
+            let mut w = 0usize;
+            while w < n_warps as usize {
+                tot += ss_sh[w];
+                w += 1;
+            }
+            ss_sh[0] = tot / (k as f32) + eps; // mean-square + eps (reuse slot 0)
+        }
+        sync_cube();
+        s = ss_sh[0].sqrt().recip();
+        sync_cube();
+        // RHT in place on the gamma'd activation (per 32-block butterfly).
+        if comptime!(rht_signs.0.len() > 0) {
+            let mut blk = warp as usize;
+            while blk < nblk {
+                let mut v = a_sh[blk * 32 + lane as usize] * signs[lane as usize];
+                let mut mask = 1u32;
+                while mask < 32 {
+                    let p = plane_shuffle_xor(v, mask);
+                    if (lane & mask) == 0 { v = v + p; } else { v = p - v; }
+                    mask *= 2;
+                }
+                a_sh[blk * 32 + lane as usize] = v * comptime!(crate::codebook::INV_SQRT32);
+                blk += n_warps as usize;
+            }
+            sync_cube();
+        }
+    } else if comptime!(rht_signs.0.len() > 0) {
+        // stage with forward-RHT per 32-block (warp = block, lane = element).
         let mut blk = warp as usize;
         while blk < nblk {
             let mut v = f32::cast_from(a[blk * 32 + lane as usize]) * signs[lane as usize];
             let mut mask = 1u32;
             while mask < 32 {
                 let p = plane_shuffle_xor(v, mask);
-                if (lane & mask) == 0 {
-                    v = v + p;
-                } else {
-                    v = p - v;
-                }
+                if (lane & mask) == 0 { v = v + p; } else { v = p - v; }
                 mask *= 2;
             }
             a_sh[blk * 32 + lane as usize] = v * comptime!(crate::codebook::INV_SQRT32);
             blk += n_warps as usize;
         }
+        sync_cube();
     } else {
         let mut i = UNIT_POS as usize;
         while i < kk {
             a_sh[i] = f32::cast_from(a[i]);
             i += CUBE_DIM as usize;
         }
+        sync_cube();
     }
-    sync_cube();
 
     // each warp dots its column against the staged activation, dequant-on-read.
     if col < nn {
@@ -383,7 +431,7 @@ fn qa_gemv_kernel<F: Float>(
         }
         let total = plane_sum(partial);
         if lane == 0 {
-            out[col] = total;
+            out[col] = total * s; // s = RMSNorm scale (1.0 when !do_norm)
         }
     }
 }
@@ -406,7 +454,14 @@ pub fn launch_panel<R: Runtime, F: Float>(
     m: usize,
     n: usize,
     k: usize,
+    // RMSNorm fold (decode m==1 only): `gamma` is `[k]`; `do_norm` enables the
+    // in-kernel input_ln/post_ln. When `do_norm` is false `gamma` is unread (pass a
+    // dummy handle). `eps` is the RMSNorm epsilon.
+    gamma: Handle,
+    do_norm: bool,
+    eps: f32,
 ) {
+    debug_assert!(!do_norm || m == 1, "in-kernel RMSNorm fold only supports the m==1 gemv");
     let units = k / 16;
     let wpu = words_per_unit(value);
     // Decode (M = 1): the warp-per-column GEMV — no row reuse, so dequant-on-read
@@ -425,11 +480,14 @@ pub fn launch_panel<R: Runtime, F: Float>(
                 BufferArg::from_raw_parts(w_codes, n * units * wpu),
                 BufferArg::from_raw_parts(w_scales, n * units),
                 BufferArg::from_raw_parts(out, m * n),
+                BufferArg::from_raw_parts(gamma, if do_norm { k } else { 1 }),
                 codebook,
                 rht_signs,
                 n as u32,
                 k as u32,
                 value,
+                do_norm,
+                eps,
             );
         }
         return;
