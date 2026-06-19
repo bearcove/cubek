@@ -187,6 +187,76 @@ pub fn test_matmul_quantized_lhs() {
     });
 }
 
+// --- QaGemv: the fusible single-pass decode gemv (quant weight = lhs, n = 1) ---
+// Validate the routine against the CPU oracle at the decode MatVec shape.
+
+#[test]
+pub fn test_matmul_qa_gemv_q8s() {
+    run_quantized_matmul(QuantizedMatmulCase {
+        m: 128,
+        n: 1,
+        k: 256,
+        lhs_scheme: Some(tensor_scheme(QuantValue::Q8S)),
+        strategy: Strategy::QaGemv,
+        ..Default::default()
+    });
+}
+
+#[test]
+pub fn test_matmul_qa_gemv_q8s_naive_control() {
+    // Same shape/scheme as the failing QaGemv Q8S case, but the known-good naive
+    // kernel — isolates whether the Q8S failure is the kernel or the n=1 setup.
+    run_quantized_matmul(QuantizedMatmulCase {
+        m: 128,
+        n: 1,
+        k: 256,
+        lhs_scheme: Some(tensor_scheme(QuantValue::Q8S)),
+        strategy: Strategy::Naive,
+        ..Default::default()
+    });
+}
+
+#[test]
+pub fn test_matmul_qa_gemv_q4s() {
+    run_quantized_matmul(QuantizedMatmulCase {
+        m: 128,
+        n: 1,
+        k: 256,
+        lhs_scheme: Some(tensor_scheme(QuantValue::Q4S)),
+        strategy: Strategy::QaGemv,
+        ..Default::default()
+    });
+}
+
+#[test]
+pub fn test_matmul_qa_gemv_q4s_decode_shape() {
+    // The real decode shape: 2048 output channels × 2048 K, exercises multi-cube
+    // dispatch (m far exceeds one cube's thread count).
+    run_quantized_matmul(QuantizedMatmulCase {
+        m: 2048,
+        n: 1,
+        k: 2048,
+        lhs_scheme: Some(block_scheme(QuantValue::Q4S, [1u8, 32])),
+        strategy: Strategy::QaGemv,
+        epsilon_scale: 2.0,
+        ..Default::default()
+    });
+}
+
+#[test]
+pub fn test_matmul_qa_gemv_q4s_block() {
+    // Block-scaled 4-bit — closest to the TQ4 decode weight layout.
+    run_quantized_matmul(QuantizedMatmulCase {
+        m: 256,
+        n: 1,
+        k: 512,
+        lhs_scheme: Some(block_scheme(QuantValue::Q4S, [1u8, 32])),
+        strategy: Strategy::QaGemv,
+        epsilon_scale: 2.0,
+        ..Default::default()
+    });
+}
+
 #[test]
 pub fn test_matmul_quantized_lhs_q8f() {
     run_quantized_matmul(QuantizedMatmulCase {

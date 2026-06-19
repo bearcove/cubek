@@ -86,6 +86,10 @@ impl InputDataType {
                         let factor = scheme.num_quants();
                         StorageType::Packed(elem, factor)
                     }
+                    QuantStore::PackedU32Dense(_) => unimplemented!(
+                        "PackedU32Dense (dense codebook packing) isn't produced by the generic \
+                         test-tensor generator; use PackedU32/block schemes or the qa kernels"
+                    ),
                 }
             }
         }

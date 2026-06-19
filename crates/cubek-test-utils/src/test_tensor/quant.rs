@@ -36,6 +36,9 @@ pub(crate) fn apply_quantization(
         QuantStore::PackedNative(_) | QuantStore::Native => {
             StorageType::Scalar(ElemType::from_quant_value(scheme.value))
         }
+        QuantStore::PackedU32Dense(_) => unimplemented!(
+            "PackedU32Dense isn't produced by the generic test-tensor generator"
+        ),
     };
 
     let mut quant_shape = original_shape.clone();
@@ -49,6 +52,9 @@ pub(crate) fn apply_quantization(
             }
         }
         QuantStore::Native => {}
+        QuantStore::PackedU32Dense(_) => unimplemented!(
+            "PackedU32Dense isn't produced by the generic test-tensor generator"
+        ),
     }
 
     let output_handle = TestInput::builder(client.clone(), quant_shape)

@@ -40,6 +40,7 @@ use crate::{
         },
         into_contiguous_if_highly_permuted,
         naive::launch as launch_naive,
+        qa_gemv::launch as launch_qa_gemv,
     },
 };
 
@@ -190,6 +191,7 @@ pub enum Strategy {
     Gemm(BlueprintStrategy<(), GemmRoutine>),
     CpuGemm(BlueprintStrategy<(), CpuGemmRoutine>),
     Naive,
+    QaGemv,
     #[default]
     Auto,
 }
@@ -242,6 +244,7 @@ impl Display for Strategy {
             Strategy::SimpleVecMat(s) => write!(f, "matmul_simple_vecmat{}", s),
             Strategy::DoubleVecMat(s) => write!(f, "matmul_double_vecmat{}", s),
             Strategy::Naive => f.write_str("matmul_naive"),
+            Strategy::QaGemv => f.write_str("matmul_qa_gemv"),
             Strategy::Auto => f.write_str("matmul_auto"),
             Strategy::GemvUnitPerpendicular(s) => write!(f, "vecmat_unit_perpendicular{}", s),
             Strategy::Gemm(s) => write!(f, "gemm{}", s),
@@ -531,6 +534,7 @@ impl Strategy {
                 launch_tiling::launch_ref(client, lhs, rhs, out, selection, dtypes)
             }
             Strategy::Naive => launch_naive::launch_ref(client, lhs, rhs, out, dtypes),
+            Strategy::QaGemv => launch_qa_gemv::launch_ref(client, lhs, rhs, out, dtypes),
             Strategy::Auto => auto(client, lhs, rhs, out, dtypes),
             Strategy::GemvUnitPerpendicular(blueprint_strategy) => {
                 launch_gemv_unit_perpendicular::launch_ref(

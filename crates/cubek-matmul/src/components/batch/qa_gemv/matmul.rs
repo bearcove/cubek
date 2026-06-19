@@ -108,11 +108,9 @@ impl<MT: MatmulTypes> BatchMatmul<(), MT> for QaGemvMatmul<MT> {
     ) {
         // The decode GEMV: out[m, 0] = Σ_k lhs[m, k] · rhs[k, 0], with the WEIGHT
         // as lhs (the matrix, m = output channels) and the activation as rhs
-        // (the vector, n = 1). One PLANE (warp) owns one output row m; the lanes
-        // split the K-reduction and a single plane_sum collapses it. Single pass
-        // (vs the generic unit matvec's split-K), and — being a routine that
-        // reads lhs/rhs through the Args views and writes through view_out — it
-        // is fusible: burn-fusion attaches the surrounding prologue/epilogue.
+        // (the vector, n = 1). One thread per output row m computes the full dot.
+        // Reading lhs/rhs through the Args views and writing through view_out
+        // makes it fusible — burn-fusion attaches the surrounding prologue/epilogue.
         let lhs = Args::view_lhs(state);
         let rhs = Args::view_rhs(state);
         let out = Args::view_out(state);
@@ -120,9 +118,9 @@ impl<MT: MatmulTypes> BatchMatmul<(), MT> for QaGemvMatmul<MT> {
         let (_, _, k) = lhs.shape();
         let (_, size_m, _) = out.shape();
 
-        // One plane per output row: CubeDim = (plane_dim, num_planes), so the
-        // plane index is the Y unit and the lane is the X unit within the plane.
-        let row = ABSOLUTE_POS_Y;
+        // Flat thread → output row. The (x, y) grid axes index rows, z indexes the
+        // batch (the cube_count is laid out accordingly in `qa_gemv_cube_count`).
+        let row = ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X;
         let batch = ABSOLUTE_POS_Z as usize;
 
         let lhs_batch = Args::batch_lhs(state, batch);
@@ -132,34 +130,21 @@ impl<MT: MatmulTypes> BatchMatmul<(), MT> for QaGemvMatmul<MT> {
         let out_batch = Args::batch_out(state, batch);
         let mut out = out.view_mut(SliceIndex::new(out_batch, out.shape()));
 
-        if row >= size_m {
-            terminate!();
-        }
-
-        let vector_size = comptime![Ord::max(lhs.vector_size(), rhs.vector_size())];
-        let size!(NA) = vector_size;
-        let lane = UNIT_POS_PLANE;
-        let stride = PLANE_DIM * vector_size as u32;
-
-        // Each lane walks its share of K (strided by the plane), accumulating a
-        // partial dot; plane_sum then reduces across the warp.
-        let mut acc = AccRE::<MT>::zero();
-        let mut k_pos = lane * vector_size as u32;
-        while k_pos < k {
-            let lhs_vec = load_unrolled::<_, _, NA>(&lhs, (row, k_pos), MatrixLayout::RowMajor);
-            let rhs_vec = load_unrolled::<_, _, NA>(&rhs, (k_pos, 0), MatrixLayout::ColMajor);
-            let prod = Vector::<AccRE<MT>, NA>::cast_from(lhs_vec)
-                * Vector::<AccRE<MT>, NA>::cast_from(rhs_vec);
-            #[unroll]
-            for v in 0..vector_size {
-                acc += prod.extract(v);
+        if row < size_m {
+            let vector_size = comptime![Ord::max(lhs.vector_size(), rhs.vector_size())];
+            let size!(NA) = vector_size;
+            let mut acc = AccRE::<MT>::zero();
+            for kb in range_stepped(0u32, k, vector_size as u32) {
+                let lhs_vec = load_unrolled::<_, _, NA>(&lhs, (row, kb), MatrixLayout::RowMajor);
+                let rhs_vec = load_unrolled::<_, _, NA>(&rhs, (kb, 0), MatrixLayout::ColMajor);
+                let prod = Vector::<AccRE<MT>, NA>::cast_from(lhs_vec)
+                    * Vector::<AccRE<MT>, NA>::cast_from(rhs_vec);
+                #[unroll]
+                for v in 0..vector_size {
+                    acc += prod.extract(v);
+                }
             }
-            k_pos += stride;
-        }
-
-        let total = plane_sum(acc);
-        if lane == 0 {
-            out.write((row, 0), Vector::cast_from(total));
+            out.write((row, 0), Vector::cast_from(acc));
         }
     }
 }

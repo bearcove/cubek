@@ -138,33 +138,32 @@ impl BatchMatmulRoutine<()> for QaGemvRoutine {
             blueprint,
             dtypes,
             cube_dim,
-            cube_count_plan: qa_gemv_cube_count(&problem.out_shape, cube_dim.y)?,
+            cube_count_plan: qa_gemv_cube_count(&problem.out_shape, cube_dim.x * cube_dim.y)?,
             address_type: problem.address_type,
             vector_sizes: device_settings.vector_sizes,
         })
     }
 }
 
-/// One output row per plane: lay the `m` rows of `out [.., m, n]` across the
-/// cube grid's Y axis (`cube_dim.y` = planes per cube), with the lane axis (X)
-/// reserved for the in-plane K reduction. `n` (= 1 for the decode MatVec) and
-/// the lane axis take a single cube each.
+/// One thread per output row: the kernel flattens the (x, y) grid axes into the
+/// row index, so we need `ceil(m / threads_per_cube)` cubes along Y (X stays a
+/// single cube). `z` indexes the batch.
 #[allow(clippy::result_large_err)]
 fn qa_gemv_cube_count(
     output_shape: &[usize],
-    planes_per_cube: u32,
+    threads_per_cube: u32,
 ) -> Result<CubeCountPlan, MatmulSetupError> {
     let ndims = output_shape.len();
     let m = output_shape[ndims - 2];
 
-    let row_cubes = f32::ceil(m as f32 / planes_per_cube as f32) as u32;
+    let row_cubes = f32::ceil(m as f32 / threads_per_cube as f32) as u32;
     let mut batch_cubes = 1u32;
     #[allow(clippy::needless_range_loop)]
     for i in 0..ndims - 2 {
         batch_cubes *= output_shape[i] as u32;
     }
 
-    let cube_count_plan = CubeCountPlan::new_from_problem((1, row_cubes, batch_cubes).into());
+    let cube_count_plan = CubeCountPlan::new_from_problem((1, row_cubes.max(1), batch_cubes).into());
     let max_cube_count = u16::MAX as u32;
     if row_cubes > max_cube_count || batch_cubes > max_cube_count {
         return Err(MatmulSetupError::Unavailable(

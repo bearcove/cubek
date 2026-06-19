@@ -67,3 +67,14 @@ opt-level = 0
 
 [profile.dev.build-override]
 opt-level = 3
+
+# Redirect the tracel-ai cubecl git deps to the bearcove fork (sibling checkout),
+# so the cubek workspace resolves/tests standalone — the fork carries the TQ
+# codebook additions (QuantMode::Codebook, QuantStore::PackedU32Dense, the
+# Codebook centroid table) that upstream cubecl-common lacks. Mirrors helix-burn's
+# patch; cargo honors `[patch]` only from the build-root manifest, so it's active
+# for a standalone `cargo` here and inert when built through helix-burn.
+[patch."https://github.com/tracel-ai/cubecl"]
+cubecl        = { path = "../cubecl/crates/cubecl" }
+cubecl-common = { path = "../cubecl/crates/cubecl-common" }
+cubecl-zspace = { path = "../cubecl/crates/cubecl-zspace" }
