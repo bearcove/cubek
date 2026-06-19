@@ -3,6 +3,7 @@
 pub mod gemm;
 pub mod gemv_unit_perpendicular;
 pub mod naive;
+pub mod qa_gemv;
 
 mod base;
 mod layout;
