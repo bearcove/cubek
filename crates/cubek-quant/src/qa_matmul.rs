@@ -327,7 +327,12 @@ fn qa_gemv_kernel<F: Float>(
     // scratch for the in-kernel RMSNorm reduction.
     let mut lut = Shared::<[f32]>::new_slice(levels);
     let mut signs = Shared::<[f32]>::new_slice(32usize);
-    let mut a_sh = Shared::<[f32]>::new_slice(k as usize);
+    // Staged (post-RHT) activation in f16: this is the dominant threadgroup
+    // allocation (K·4B in f32), and halving it to K·2B roughly doubles cube
+    // co-residency / occupancy. The butterfly accumulation and the Σh² reduction
+    // stay f32 (the reduction uses the f32 register `hi`, not a_sh), so only the
+    // staged value rounds to f16 — negligible against 4-bit weights.
+    let mut a_sh = Shared::<[f16]>::new_slice(k as usize);
     let mut ss_sh = Shared::<[f32]>::new_slice(32usize);
     if UNIT_POS == 0 {
         #[unroll]
@@ -353,7 +358,7 @@ fn qa_gemv_kernel<F: Float>(
         while i < kk {
             let hi = f32::cast_from(a[i]);
             ss += hi * hi;
-            a_sh[i] = hi * f32::cast_from(gamma[i]);
+            a_sh[i] = f16::cast_from(hi * f32::cast_from(gamma[i]));
             i += CUBE_DIM as usize;
         }
         // Cross-warp reduce Σh²: warp plane_sum → per-warp shared → thread 0 sums.
@@ -378,14 +383,14 @@ fn qa_gemv_kernel<F: Float>(
         if comptime!(rht_signs.0.len() > 0) {
             let mut blk = warp as usize;
             while blk < nblk {
-                let mut v = a_sh[blk * 32 + lane as usize] * signs[lane as usize];
+                let mut v = f32::cast_from(a_sh[blk * 32 + lane as usize]) * signs[lane as usize];
                 let mut mask = 1u32;
                 while mask < 32 {
                     let p = plane_shuffle_xor(v, mask);
                     if (lane & mask) == 0 { v = v + p; } else { v = p - v; }
                     mask *= 2;
                 }
-                a_sh[blk * 32 + lane as usize] = v * comptime!(crate::codebook::INV_SQRT32);
+                a_sh[blk * 32 + lane as usize] = f16::cast_from(v * comptime!(crate::codebook::INV_SQRT32));
                 blk += n_warps as usize;
             }
             sync_cube();
@@ -401,14 +406,14 @@ fn qa_gemv_kernel<F: Float>(
                 if (lane & mask) == 0 { v = v + p; } else { v = p - v; }
                 mask *= 2;
             }
-            a_sh[blk * 32 + lane as usize] = v * comptime!(crate::codebook::INV_SQRT32);
+            a_sh[blk * 32 + lane as usize] = f16::cast_from(v * comptime!(crate::codebook::INV_SQRT32));
             blk += n_warps as usize;
         }
         sync_cube();
     } else {
         let mut i = UNIT_POS as usize;
         while i < kk {
-            a_sh[i] = f32::cast_from(a[i]);
+            a_sh[i] = f16::cast_from(a[i]);
             i += CUBE_DIM as usize;
         }
         sync_cube();
@@ -425,7 +430,7 @@ fn qa_gemv_kernel<F: Float>(
             let base = (col * units + unit) * wpu;
             let code = dense_code_dyn(w_codes, base, jj, value);
             let sw = f32::cast_from(w_scales[col * units + unit]);
-            partial += lut[code as usize] * sw * a_sh[p];
+            partial += lut[code as usize] * sw * f32::cast_from(a_sh[p]);
             blk += 1;
         }
         let total = plane_sum(partial);
