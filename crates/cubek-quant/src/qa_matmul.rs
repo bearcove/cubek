@@ -298,7 +298,7 @@ fn qa_gemm_panel_kernel<F: Float>(
 /// and reused across the cube's columns (the `tile_wide` trick), so the butterfly
 /// runs `CUBE_DIM/PLANE_DIM`× fewer times than a per-column in-line RHT.
 #[cube(launch_unchecked)]
-fn qa_gemv_kernel<F: Float>(
+fn qa_gemv_kernel<F: Float, S: Float>(
     a: &[F],         // [1, K] RAW activation (RMSNorm + forward-RHT applied in-kernel)
     w_codes: &[u32], // [N, K] dense codebook weights (rotated, packed)
     w_scales: &[f16],
@@ -327,12 +327,13 @@ fn qa_gemv_kernel<F: Float>(
     // scratch for the in-kernel RMSNorm reduction.
     let mut lut = Shared::<[f32]>::new_slice(levels);
     let mut signs = Shared::<[f32]>::new_slice(32usize);
-    // Staged (post-RHT) activation in f16: this is the dominant threadgroup
-    // allocation (K·4B in f32), and halving it to K·2B roughly doubles cube
-    // co-residency / occupancy. The butterfly accumulation and the Σh² reduction
-    // stay f32 (the reduction uses the f32 register `hi`, not a_sh), so only the
-    // staged value rounds to f16 — negligible against 4-bit weights.
-    let mut a_sh = Shared::<[f16]>::new_slice(k as usize);
+    // Staged (post-RHT) activation in `S` (f16 by default, f32 via QA_STAGE_F32):
+    // this is the dominant threadgroup allocation (K·4B in f32), and halving it to
+    // K·2B roughly doubles cube co-residency / occupancy. The butterfly
+    // accumulation and the Σh² reduction stay f32 (the reduction uses the f32
+    // register `hi`, not a_sh), so only the staged value rounds to f16 —
+    // negligible against 4-bit weights.
+    let mut a_sh = Shared::<[S]>::new_slice(k as usize);
     let mut ss_sh = Shared::<[f32]>::new_slice(32usize);
     if UNIT_POS == 0 {
         #[unroll]
@@ -358,7 +359,7 @@ fn qa_gemv_kernel<F: Float>(
         while i < kk {
             let hi = f32::cast_from(a[i]);
             ss += hi * hi;
-            a_sh[i] = f16::cast_from(hi * f32::cast_from(gamma[i]));
+            a_sh[i] = S::cast_from(hi * f32::cast_from(gamma[i]));
             i += CUBE_DIM as usize;
         }
         // Cross-warp reduce Σh²: warp plane_sum → per-warp shared → thread 0 sums.
@@ -390,7 +391,7 @@ fn qa_gemv_kernel<F: Float>(
                     if (lane & mask) == 0 { v = v + p; } else { v = p - v; }
                     mask *= 2;
                 }
-                a_sh[blk * 32 + lane as usize] = f16::cast_from(v * comptime!(crate::codebook::INV_SQRT32));
+                a_sh[blk * 32 + lane as usize] = S::cast_from(v * comptime!(crate::codebook::INV_SQRT32));
                 blk += n_warps as usize;
             }
             sync_cube();
@@ -406,14 +407,14 @@ fn qa_gemv_kernel<F: Float>(
                 if (lane & mask) == 0 { v = v + p; } else { v = p - v; }
                 mask *= 2;
             }
-            a_sh[blk * 32 + lane as usize] = f16::cast_from(v * comptime!(crate::codebook::INV_SQRT32));
+            a_sh[blk * 32 + lane as usize] = S::cast_from(v * comptime!(crate::codebook::INV_SQRT32));
             blk += n_warps as usize;
         }
         sync_cube();
     } else {
         let mut i = UNIT_POS as usize;
         while i < kk {
-            a_sh[i] = f16::cast_from(a[i]);
+            a_sh[i] = S::cast_from(a[i]);
             i += CUBE_DIM as usize;
         }
         sync_cube();
@@ -475,23 +476,36 @@ pub fn launch_panel<R: Runtime, F: Float>(
         let cubes = n.div_ceil(WARPS);
         let grid_x = cubes.min(65535);
         let grid_y = cubes.div_ceil(grid_x);
+        // Staged activation lives in threadgroup memory (the dominant alloc): f16
+        // by default to lift occupancy; QA_STAGE_F32=1 forces the f32 baseline for
+        // A/B (occupancy + WER) measurement.
+        let stage_f32 = std::env::var("QA_STAGE_F32").is_ok();
+        macro_rules! gemv {
+            ($s:ty) => {
+                qa_gemv_kernel::launch_unchecked::<F, $s, R>(
+                    client,
+                    CubeCount::Static(grid_x as u32, grid_y as u32, 1),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(a, m * k),
+                    BufferArg::from_raw_parts(w_codes, n * units * wpu),
+                    BufferArg::from_raw_parts(w_scales, n * units),
+                    BufferArg::from_raw_parts(out, m * n),
+                    BufferArg::from_raw_parts(gamma, if do_norm { k } else { 1 }),
+                    codebook,
+                    rht_signs,
+                    n as u32,
+                    k as u32,
+                    value,
+                    do_norm,
+                )
+            };
+        }
         unsafe {
-            qa_gemv_kernel::launch_unchecked::<F, R>(
-                client,
-                CubeCount::Static(grid_x as u32, grid_y as u32, 1),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(a, m * k),
-                BufferArg::from_raw_parts(w_codes, n * units * wpu),
-                BufferArg::from_raw_parts(w_scales, n * units),
-                BufferArg::from_raw_parts(out, m * n),
-                BufferArg::from_raw_parts(gamma, if do_norm { k } else { 1 }),
-                codebook,
-                rht_signs,
-                n as u32,
-                k as u32,
-                value,
-                do_norm,
-            );
+            if stage_f32 {
+                gemv!(f32);
+            } else {
+                gemv!(f16);
+            }
         }
         return;
     }
