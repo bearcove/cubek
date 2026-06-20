@@ -195,9 +195,11 @@ fn qa_gemm_panel_kernel<F: Float>(
         // --- shared ±1 RHT sign pattern (32-wide), indexable by runtime lane ---
         let mut signs = Shared::<[f32]>::new_slice(32usize);
         if UNIT_POS == 0 {
-            #[unroll]
-            for i in 0..levels {
-                lut[i] = f32::new(comptime!(codebook.0[i]));
+            if comptime!(!value.is_symmetric()) {
+                #[unroll]
+                for i in 0..levels {
+                    lut[i] = f32::new(comptime!(codebook.0[i]));
+                }
             }
             if comptime!(rht_signs.0.len() > 0) {
                 #[unroll]
@@ -216,8 +218,16 @@ fn qa_gemm_panel_kernel<F: Float>(
             let sw = f32::cast_from(w_scales[col * units + u]);
             #[unroll]
             for j in 0..16usize {
-                let wi = dense_code(w_codes, w_base, j, value);
-                w_col[u * 16 + j] = lut[wi as usize] * sw;
+                let raw = dense_code(w_codes, w_base, j, value);
+                let wv = if comptime!(value.is_symmetric()) {
+                    let sign_bit = comptime!(1u32 << (value.size_bits() - 1));
+                    let two_pow = comptime!(1i32 << value.size_bits());
+                    let neg = i32::cast_from(raw >= sign_bit);
+                    f32::cast_from(i32::cast_from(raw) - neg * two_pow)
+                } else {
+                    lut[raw as usize]
+                };
+                w_col[u * 16 + j] = wv * sw;
             }
             u += CUBE_DIM as usize;
         }
