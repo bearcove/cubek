@@ -249,11 +249,10 @@ fn qa_gemm_panel_kernel<F: Float>(
                     let mut mask = 1u32;
                     while mask < 32 {
                         let p = plane_shuffle_xor(v, mask);
-                        if (lane & mask) == 0 {
-                            v = v + p;
-                        } else {
-                            v = p - v;
-                        }
+                        // Branchless Hadamard step: low lane → v+p, high → p−v = (−v)+p.
+                        // A `select` instead of a warp-divergent ±1 branch (the hottest
+                        // line of the in-kernel RHT preamble, ~19% of the gemv).
+                        v = select((lane & mask) == 0, v, -v) + p;
                         mask *= 2;
                     }
                     acc += v
@@ -382,7 +381,7 @@ fn qa_gemv_kernel<F: Float>(
                 let mut mask = 1u32;
                 while mask < 32 {
                     let p = plane_shuffle_xor(v, mask);
-                    if (lane & mask) == 0 { v = v + p; } else { v = p - v; }
+                    v = select((lane & mask) == 0, v, -v) + p; // branchless Hadamard step
                     mask *= 2;
                 }
                 a_sh[blk * 32 + lane as usize] = v * comptime!(crate::codebook::INV_SQRT32);
