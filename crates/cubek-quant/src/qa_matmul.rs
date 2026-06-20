@@ -336,9 +336,14 @@ fn qa_gemv_kernel<F: Float, S: Float>(
     let mut a_sh = Shared::<[S]>::new_slice(k as usize);
     let mut ss_sh = Shared::<[f32]>::new_slice(32usize);
     if UNIT_POS == 0 {
-        #[unroll]
-        for i in 0..levels {
-            lut[i] = f32::new(comptime!(codebook.0[i]));
+        // Codebook (table) values fill the LUT; symmetric (Q4S/Q8S/…) read no
+        // centroid table — the dequant is `signed(raw)·scale`, so skip the fill
+        // (codebook.0 is empty for symmetric values).
+        if comptime!(!value.is_symmetric()) {
+            #[unroll]
+            for i in 0..levels {
+                lut[i] = f32::new(comptime!(codebook.0[i]));
+            }
         }
         if comptime!(rht_signs.0.len() > 0) {
             #[unroll]
@@ -429,9 +434,19 @@ fn qa_gemv_kernel<F: Float, S: Float>(
             let unit = p / 16; // half-block unit (own fp16 scale)
             let jj = (p % 16) as u32; // code index within the unit
             let base = (col * units + unit) * wpu;
-            let code = dense_code_dyn(w_codes, base, jj, value);
+            let raw = dense_code_dyn(w_codes, base, jj, value);
+            // Codebook → centroid gather; symmetric → two's-complement signed
+            // value (no LUT/gather), the cheap affine path (the iPhone-bound dequant).
+            let wq = if comptime!(value.is_symmetric()) {
+                let sign_bit = comptime!(1u32 << (value.size_bits() - 1));
+                let two_pow = comptime!(1i32 << value.size_bits());
+                let neg = i32::cast_from(raw >= sign_bit);
+                f32::cast_from(i32::cast_from(raw) - neg * two_pow)
+            } else {
+                lut[raw as usize]
+            };
             let sw = f32::cast_from(w_scales[col * units + unit]);
-            partial += lut[code as usize] * sw * f32::cast_from(a_sh[p]);
+            partial += wq * sw * f32::cast_from(a_sh[p]);
             blk += 1;
         }
         let total = plane_sum(partial);
@@ -698,6 +713,142 @@ pub fn launch_activation_quant<R: Runtime>(
             BufferArg::from_raw_parts(codes, m * k * bits / 32),
             BufferArg::from_raw_parts(scales, m * k / 16),
             codebook,
+            rht_signs,
+            k as u32,
+            value,
+        );
+    }
+}
+
+/// Symmetric (affine int) analogue of [`quantize_activations_kernel`]: RHT-forward
+/// → per-half-block `maxabs/qmax` scale → round-to-signed (two's complement) →
+/// dense pack. No codebook/Lloyd — the cheap quant the iPhone CPU port targets.
+/// Output layout is identical (dense `bits` u32 + 2 fp16 per 32-value block), so
+/// the same gemv consumes it (via its `is_symmetric` branch).
+#[cube(launch_unchecked)]
+fn quantize_symmetric_activations_kernel(
+    hidden: &[f32],
+    codes: &mut [u32],
+    scales: &mut [f16],
+    #[comptime] rht_signs: RhtSigns,
+    #[comptime] hidden_dim: u32,
+    #[comptime] value: QuantValue,
+) {
+    let block = ABSOLUTE_POS as usize;
+    let n_blocks = (hidden.len()) / 32;
+    if block < n_blocks {
+        let bpr = comptime!((hidden_dim / 32) as usize);
+        let row = block / bpr;
+        let b = block % bpr;
+        let in_base = row * (hidden_dim as usize) + b * 32;
+        let words_per_block = comptime!(value.size_bits());
+        let qmax = comptime!(value.range().1); // 7.0 for Q4S (symmetric)
+        let cmask = comptime!((1u32 << value.size_bits()) - 1);
+
+        // load + forward RHT (signs → butterfly → 1/sqrt(32)) — identical to the
+        // codebook path so the rotation matches the gemv's in-kernel RHT.
+        let mut buf = Array::<f32>::new(32usize);
+        #[unroll]
+        for j in 0..32usize {
+            buf[j] = hidden[in_base + j] * comptime!(rht_signs.0[j]);
+        }
+        let mut step = 1usize;
+        while step < 32 {
+            let span = step * 2;
+            let mut q = 0usize;
+            while q < 32 {
+                for idx in q..q + step {
+                    let a = buf[idx];
+                    let c = buf[idx + step];
+                    buf[idx] = a + c;
+                    buf[idx + step] = a - c;
+                }
+                q += span;
+            }
+            step *= 2;
+        }
+        #[unroll]
+        for j in 0..32usize {
+            buf[j] = buf[j] * comptime!(crate::codebook::INV_SQRT32);
+        }
+
+        // per-half-block symmetric scale = maxabs / qmax.
+        let mut m_lo = 0.0f32;
+        let mut m_hi = 0.0f32;
+        #[unroll]
+        for j in 0..16usize {
+            let alo = buf[j].abs();
+            let ahi = buf[j + 16].abs();
+            if alo > m_lo {
+                m_lo = alo;
+            }
+            if ahi > m_hi {
+                m_hi = ahi;
+            }
+        }
+        let d_lo = m_lo / qmax;
+        let d_hi = m_hi / qmax;
+        scales[block * 2] = f16::cast_from(d_lo);
+        scales[block * 2 + 1] = f16::cast_from(d_hi);
+
+        // round-to-signed + dense pack (two's complement nibble; the gemv sign-
+        // extends it back).
+        let fi_lo = if d_lo > 1e-10f32 { 1.0f32 / d_lo } else { 0.0f32 };
+        let fi_hi = if d_hi > 1e-10f32 { 1.0f32 / d_hi } else { 0.0f32 };
+        let mut words = Array::<u32>::new(words_per_block);
+        #[unroll]
+        for w in 0..words_per_block {
+            words[w] = 0u32;
+        }
+        #[unroll]
+        for j in 0..32usize {
+            let inv = if j < 16 { fi_lo } else { fi_hi };
+            let mut q = (buf[j] * inv).round();
+            if q > qmax {
+                q = qmax;
+            }
+            if q < -qmax {
+                q = -qmax;
+            }
+            let code = u32::cast_from(i32::cast_from(q)) & cmask;
+            let bits = comptime!(value.size_bits());
+            let word = comptime!((j * bits) / 32);
+            let bitoff = comptime!((j * bits) % 32);
+            words[word] = words[word] | (code << comptime!(bitoff as u32));
+            if comptime!(bitoff + bits > 32) {
+                words[word + 1] = words[word + 1] | (code >> comptime!((32 - bitoff) as u32));
+            }
+        }
+        #[unroll]
+        for w in 0..words_per_block {
+            codes[block * words_per_block + w] = words[w];
+        }
+    }
+}
+
+/// Quantize `hidden [m, k]` to a symmetric affine `value` (Q4S/…) in prerot space:
+/// dense codes `[m, k·bits/32]` u32 + `[m, k/16]` fp16 scales. Mirror of
+/// [`launch_activation_quant`] for the no-codebook path.
+pub fn launch_symmetric_activation_quant<R: Runtime>(
+    client: &ComputeClient<R>,
+    value: QuantValue,
+    hidden: Handle,
+    codes: Handle,
+    scales: Handle,
+    rht_signs: RhtSigns,
+    m: usize,
+    k: usize,
+) {
+    let bits = value.size_bits();
+    let n_blocks = (m * k / 32) as u32;
+    unsafe {
+        quantize_symmetric_activations_kernel::launch_unchecked::<R>(
+            client,
+            CubeCount::Static(n_blocks.div_ceil(256), 1, 1),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(hidden, m * k),
+            BufferArg::from_raw_parts(codes, m * k * bits / 32),
+            BufferArg::from_raw_parts(scales, m * k / 16),
             rht_signs,
             k as u32,
             value,
